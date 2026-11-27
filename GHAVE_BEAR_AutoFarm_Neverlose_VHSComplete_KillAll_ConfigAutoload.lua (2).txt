@@ -1,0 +1,5722 @@
+--[[
+
+  GHAVE SCRIPTS — BEAR Alpha (Integrated Main Bear + Fixed Kill All + Redesigned ESP + Zoom)
+
+  UI: Neverlose-inspired library (touch-aware, draggable mobile launcher).
+
+  Pages: Lobby, Puzzles, Survivor, Bear, Visuals, Settings.
+  Puzzle controls (including Memory / VHS) are grouped under Puzzles.
+  Infinite Stamina remains opt-in. Fling Bear runs after the puzzle queue when enabled.
+
+]]
+
+if getgenv and getgenv().GHAVE_BEAR and getgenv().GHAVE_BEAR.unload then
+
+    pcall(getgenv().GHAVE_BEAR.unload)
+
+end
+
+local Players = game:GetService("Players")
+
+local RunService = game:GetService("RunService")
+
+local Lighting = game:GetService("Lighting")
+
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
+
+
+local player = Players.LocalPlayer
+
+-- BEAR's current client identifies round roles by Player.TeamColor and the
+-- ReplicatedStorage.Share.Database.Teams table, not Team.Name.
+local function resolveGameTeamColor(roleKey, fallbackName)
+    local ok, color = pcall(function()
+        local share = ReplicatedStorage:FindFirstChild("Share")
+        local gnumModule = share and share:FindFirstChild("Gnum")
+        local database = share and share:FindFirstChild("Database")
+        local teamsModule = database and database:FindFirstChild("Teams")
+        assert(gnumModule and teamsModule, "Team modules unavailable")
+
+        local gnum = require(gnumModule)
+        local teams = require(teamsModule)
+        local teamId = gnum.Team and gnum.Team[roleKey]
+        local teamInfo = teamId and teams[teamId]
+        return teamInfo and teamInfo.Color
+    end)
+
+    if ok and color then
+        return color
+    end
+
+    return BrickColor.new(fallbackName)
+end
+
+local BEAR_TEAM_COLOR = resolveGameTeamColor("BEAR", "Bright red")
+local SURVIVOR_TEAM_COLOR = resolveGameTeamColor("Survivor", "Bright bluish green")
+
+local ORIGINAL_CAMERA_MAX_ZOOM = player.CameraMaxZoomDistance
+local UNCAPPED_CAMERA_MAX_ZOOM = 1000000
+local zoomWasUncapped = false
+
+local Options = {
+
+    AutoFarm = false,
+
+    -- Automatically use the lobby physics part after the Survivor puzzle queue.
+    FlingBearAfterPuzzles = true,
+    GetSpectateButtonEarly = true,
+
+    -- Automatically change public servers based on this server's player count.
+    HopIfUnderPlayerCount = false,
+    UnderPlayerCount = 6,
+    HopIfOverPlayerCount = false,
+    OverPlayerCount = 10,
+    HopToHighestServer = true,
+    HopToLowestServer = false,
+
+    AutoPuzzles = false,
+
+    Quidz = false,
+
+    Wires = false,
+
+    Nearest = false,
+
+    NearestRange = 50,
+
+    ColorCode = false,
+
+    KillAll = false,
+
+    KillDelay = 0.12,
+
+    Memory = false,
+    Stamina = false,
+
+    Esp = false,
+
+    UncapZoom = false,
+
+    -- BEAR's Lights Out Survivor role can force LockFirstPerson.
+    -- This option keeps the camera in Classic mode instead.
+    DisableForcedFirstPerson = true,
+
+    Boxes = true,
+
+    Names = true,
+
+    Chams = true,
+
+    Health = true,
+
+    Tint = false,
+
+    TintColor = Color3.fromRGB(255, 255, 255),
+
+    TintIntensity = 0.5,
+
+}
+
+local Threads = {}
+
+local Connections = {}
+
+-- Full AutoFarm keeps ownership of the round. Completing the survivor queue
+-- must not disable the master toggle or restart the same queue after respawn.
+local AutoPuzzleRoundComplete = false
+local AutoPuzzleRoundBin = nil
+local AutoPuzzleRoundMap = nil
+local AutoPuzzleRoundDoneCount = nil
+local AutoPuzzleRoundTotalCount = nil
+
+local running = true
+
+local Library
+local Window
+local libraryUnload
+local unload
+local statusLabel
+local shuttingDown = false
+
+local TintEffect = Lighting:FindFirstChild("GhaveTint") or Instance.new("ColorCorrectionEffect")
+
+TintEffect.Name = "GhaveTint"
+
+TintEffect.Enabled = false
+
+TintEffect.Parent = Lighting
+
+-- Keep visual controls functional independently of the UI implementation.
+local function updateTintEffect()
+    local red = math.clamp(math.floor(tonumber(Options.TintR) or 255), 0, 255)
+    local green = math.clamp(math.floor(tonumber(Options.TintG) or 255), 0, 255)
+    local blue = math.clamp(math.floor(tonumber(Options.TintB) or 255), 0, 255)
+    local baseColor = Color3.fromRGB(red, green, blue)
+    local intensity = math.clamp(tonumber(Options.TintIntensity) or 0.5, 0, 1)
+
+    Options.TintColor = baseColor
+    TintEffect.TintColor = Color3.new(1, 1, 1):Lerp(baseColor, intensity)
+    TintEffect.Enabled = Options.Tint == true
+end
+
+local function applyCameraSettings()
+    pcall(function()
+        if Options.UncapZoom then
+            if player.CameraMaxZoomDistance ~= UNCAPPED_CAMERA_MAX_ZOOM then
+                player.CameraMaxZoomDistance = UNCAPPED_CAMERA_MAX_ZOOM
+            end
+            zoomWasUncapped = true
+        elseif zoomWasUncapped then
+            player.CameraMaxZoomDistance = ORIGINAL_CAMERA_MAX_ZOOM
+            zoomWasUncapped = false
+        end
+
+        if Options.DisableForcedFirstPerson
+            and player.CameraMode == Enum.CameraMode.LockFirstPerson then
+            player.CameraMode = Enum.CameraMode.Classic
+        end
+    end)
+end
+
+local function track(conn)
+
+    table.insert(Connections, conn)
+
+    return conn
+
+end
+
+local function getHRP(timeout)
+
+    local char = player.Character
+
+    if not char then
+
+        char = player.CharacterAdded:Wait()
+
+    end
+
+    return char:WaitForChild("HumanoidRootPart", timeout or 8)
+
+end
+
+-- Temporarily remove local character collisions and cancel gravity for
+-- puzzle interactions that require passing through map geometry. When
+-- hideCharacter is true, the character is also hidden on this client. The
+-- cleanup closure restores the original local visibility/collision values.
+local function beginNoGravityNoCollision(hideCharacter)
+    local character = player.Character
+    local root = getHRP(5)
+    if not (character and root and root:IsDescendantOf(workspace)) then
+        return function() end
+    end
+
+    local savedCollision = {}
+    local savedVisibility = {}
+    local savedHumanoidDisplay = {}
+
+    local function setSavedProperty(instance, property, hiddenValue)
+        if savedVisibility[instance] == nil then
+            local ok, originalValue = pcall(function()
+                return instance[property]
+            end)
+            if ok then
+                savedVisibility[instance] = {
+                    Property = property,
+                    Value = originalValue,
+                    HiddenValue = hiddenValue,
+                }
+            end
+        end
+        pcall(function()
+            instance[property] = hiddenValue
+        end)
+    end
+
+    local function applyLocalHide(instance)
+        if not hideCharacter or not instance then
+            return
+        end
+
+        if instance:IsA("BasePart") then
+            -- LocalTransparencyModifier is specifically client-side, so this
+            -- hides the character for the executor without changing server visuals.
+            setSavedProperty(instance, "LocalTransparencyModifier", 1)
+        elseif instance:IsA("Decal") or instance:IsA("Texture") then
+            setSavedProperty(instance, "Transparency", 1)
+        elseif instance:IsA("ParticleEmitter") or instance:IsA("Trail")
+            or instance:IsA("Beam") or instance:IsA("Smoke")
+            or instance:IsA("Fire") or instance:IsA("Sparkles")
+            or instance:IsA("PointLight") or instance:IsA("SpotLight")
+            or instance:IsA("SurfaceLight") then
+            setSavedProperty(instance, "Enabled", false)
+        elseif instance:IsA("BillboardGui") or instance:IsA("SurfaceGui")
+            or instance:IsA("Highlight") then
+            setSavedProperty(instance, "Enabled", false)
+        elseif instance:IsA("ForceField") then
+            setSavedProperty(instance, "Visible", false)
+        end
+    end
+
+    local function processDescendant(instance)
+        if instance and instance:IsA("BasePart") then
+            if savedCollision[instance] == nil then
+                savedCollision[instance] = instance.CanCollide
+            end
+            pcall(function()
+                instance.CanCollide = false
+            end)
+        end
+        applyLocalHide(instance)
+    end
+
+    for _, descendant in ipairs(character:GetDescendants()) do
+        processDescendant(descendant)
+    end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if hideCharacter and humanoid then
+        for _, property in ipairs({ "NameDisplayDistance", "HealthDisplayDistance" }) do
+            local ok, originalValue = pcall(function()
+                return humanoid[property]
+            end)
+            if ok then
+                savedHumanoidDisplay[property] = originalValue
+                pcall(function()
+                    humanoid[property] = 0
+                end)
+            end
+        end
+    end
+
+    local descendantConnection = character.DescendantAdded:Connect(processDescendant)
+    local attachment = Instance.new("Attachment")
+    attachment.Name = "GhavePuzzleZeroGravityAttachment"
+    attachment.Parent = root
+
+    local force = Instance.new("VectorForce")
+    force.Name = "GhavePuzzleZeroGravityForce"
+    force.Attachment0 = attachment
+    force.RelativeTo = Enum.ActuatorRelativeTo.World
+    force.ApplyAtCenterOfMass = true
+    force.Force = Vector3.new(0, root.AssemblyMass * workspace.Gravity, 0)
+    force.Parent = root
+
+    -- Continuously cancel gravity and re-assert local hide/noclip in case
+    -- accessories, decals, or character parts are updated while farming.
+    local gravityConnection = RunService.Heartbeat:Connect(function()
+        if root and root.Parent and force and force.Parent then
+            pcall(function()
+                force.Force = Vector3.new(0, root.AssemblyMass * workspace.Gravity, 0)
+            end)
+        end
+
+        for part in pairs(savedCollision) do
+            if part and part.Parent then
+                pcall(function()
+                    part.CanCollide = false
+                end)
+            end
+        end
+
+        if hideCharacter then
+            for instance, state in pairs(savedVisibility) do
+                if instance and instance.Parent then
+                    pcall(function()
+                        instance[state.Property] = state.HiddenValue
+                    end)
+                end
+            end
+        end
+    end)
+
+    local cleaned = false
+    return function()
+        if cleaned then
+            return
+        end
+        cleaned = true
+
+        if descendantConnection then
+            pcall(function() descendantConnection:Disconnect() end)
+        end
+        if gravityConnection then
+            pcall(function() gravityConnection:Disconnect() end)
+        end
+        if force then
+            pcall(function() force:Destroy() end)
+        end
+        if attachment then
+            pcall(function() attachment:Destroy() end)
+        end
+
+        for part, originalCanCollide in pairs(savedCollision) do
+            if part and part.Parent then
+                pcall(function()
+                    part.CanCollide = originalCanCollide
+                end)
+            end
+        end
+        for instance, state in pairs(savedVisibility) do
+            if instance and instance.Parent then
+                pcall(function()
+                    instance[state.Property] = state.Value
+                end)
+            end
+        end
+        if humanoid and humanoid.Parent then
+            for property, originalValue in pairs(savedHumanoidDisplay) do
+                pcall(function()
+                    humanoid[property] = originalValue
+                end)
+            end
+        end
+    end
+end
+
+-- Resolve the Memory map's touch transmitter to the BasePart that owns it.
+-- firetouchinterest accepts BaseParts, not the TouchInterest child instance.
+local function getMemoryMapTouchPart()
+    local map = workspace:FindFirstChild("Map")
+    local memory = map and map:FindFirstChild("Memory")
+    local base = memory and memory:FindFirstChild("Base")
+    local detect = base and base:FindFirstChild("Detect")
+    if not detect then
+        return nil
+    end
+
+    if detect:IsA("BasePart") then
+        return detect
+    end
+
+    local transmitter = detect:FindFirstChild("TouchInterest", true)
+    if transmitter and transmitter.Parent and transmitter.Parent:IsA("BasePart") then
+        return transmitter.Parent
+    end
+
+    return detect:FindFirstChildWhichIsA("BasePart", true)
+end
+
+-- The VHS pickup is separate from the Memory TV/screen trigger.
+-- The old VHS action uses Map.Memory.Item.Detect; Base.Detect is the TV
+-- interaction that opens the Memory interface.
+local function getMemoryVHSTouchPart()
+    local map = workspace:FindFirstChild("Map")
+    local memory = map and map:FindFirstChild("Memory")
+    local item = memory and memory:FindFirstChild("Item")
+    local detect = item and item:FindFirstChild("Detect")
+    if not detect then
+        return nil
+    end
+
+    if detect:IsA("BasePart") then
+        return detect
+    end
+
+    local transmitter = detect:FindFirstChild("TouchInterest", true)
+    if transmitter and transmitter.Parent and transmitter.Parent:IsA("BasePart") then
+        return transmitter.Parent
+    end
+
+    return detect:FindFirstChildWhichIsA("BasePart", true)
+end
+
+-- Manual mode preserves the original Get VHS behavior (touch the Item detect
+-- where the player currently is). AutoFarm passes true to first move to it.
+local function touchMemoryVHS(teleportFirst)
+    local hrp = getHRP(5)
+    local target = getMemoryVHSTouchPart()
+    if not (hrp and target and target:IsA("BasePart") and target:IsDescendantOf(workspace)) then
+        return false
+    end
+    if not firetouchinterest then
+        return false
+    end
+
+    return pcall(function()
+        if teleportFirst then
+            hrp.CFrame = target.CFrame * CFrame.new(0, 2, 0)
+            task.wait(0.2)
+        end
+
+        firetouchinterest(hrp, target, 0)
+        task.wait(0.08)
+        firetouchinterest(hrp, target, 1)
+    end)
+end
+
+local MEMORY_TOUCH_REPEAT_COUNT = 12
+local MEMORY_TOUCH_PRESS_TIME = 0.07
+local MEMORY_TOUCH_RELEASE_TIME = 0.10
+
+local function touchMemoryMapDetect(repeatCount)
+    local hrp = getHRP(5)
+    local target = getMemoryMapTouchPart()
+    if not (hrp and target and target:IsA("BasePart") and target:IsDescendantOf(workspace)) then
+        return false, 0
+    end
+    if not firetouchinterest then
+        return false, 0
+    end
+
+    local requested = tonumber(repeatCount) or MEMORY_TOUCH_REPEAT_COUNT
+    requested = math.clamp(math.floor(requested), 1, 24)
+    local fired = 0
+
+    local ok = pcall(function()
+        -- Move onto the map's Memory detector first. Then pulse touch on/off
+        -- repeatedly so the game's touch listener gets multiple fresh entries.
+        local verticalOffset = math.max(1.5, target.Size.Y * 0.5 + 0.5)
+        hrp.CFrame = target.CFrame * CFrame.new(0, verticalOffset, 0)
+        task.wait(0.25)
+
+        for _ = 1, requested do
+            if not running then
+                break
+            end
+
+            firetouchinterest(hrp, target, 0)
+            task.wait(MEMORY_TOUCH_PRESS_TIME)
+            firetouchinterest(hrp, target, 1)
+            fired += 1
+            task.wait(MEMORY_TOUCH_RELEASE_TIME)
+        end
+    end)
+
+    return ok and fired > 0, fired
+end
+
+
+local function isWaiting()
+
+    return player.Team and player.Team.Name == "Waiting"
+
+end
+
+local function isSurvivor()
+
+    local teamName = player.Team and player.Team.Name or ""
+
+    return player.TeamColor == SURVIVOR_TEAM_COLOR
+        or teamName == "Survivors"
+        or teamName == "Survivor"
+
+end
+
+local function isBear()
+
+    local teamName = player.Team and player.Team.Name or ""
+
+    return player.TeamColor == BEAR_TEAM_COLOR
+        or teamName == "Bear"
+        or teamName == "BEAR"
+
+end
+
+-- Decompiled timer UI reads these exact values from _Local.GameValues,
+-- which is ReplicatedStorage.Share.GameValues.
+local playerRegistry = nil
+local playerRegistryLastAttempt = 0
+
+local function getPlayerRegistry()
+
+    if playerRegistry then
+        return playerRegistry
+    end
+
+    -- ReplicatedFirst may still be loading when the farm is first enabled.
+    if os.clock() - playerRegistryLastAttempt < 3 then
+        return nil
+    end
+    playerRegistryLastAttempt = os.clock()
+
+    local module = ReplicatedFirst:FindFirstChild("PlayerRegistry")
+    if not (module and module:IsA("ModuleScript")) then
+        return nil
+    end
+
+    local ok, result = pcall(require, module)
+    if ok and type(result) == "table" then
+        playerRegistry = result
+    else
+        warn("[GHAVE][AutoFarm] PlayerRegistry unavailable: " .. tostring(result))
+    end
+
+    return playerRegistry
+
+end
+
+local function getDisplayedPuzzleProgress()
+
+    local playerGui = player:FindFirstChildOfClass("PlayerGui")
+    local gameUI = playerGui and playerGui:FindFirstChild("GameUI")
+    local display = gameUI and gameUI:FindFirstChild("InGameDisplay")
+    local timer = display and display:FindFirstChild("Timer")
+    local holder = timer and timer:FindFirstChild("HolderFrame")
+    local puzzleLabel = holder and holder:FindFirstChild("PuzzleCount")
+
+    if not (puzzleLabel and puzzleLabel:IsA("TextLabel")) then
+        return nil, nil
+    end
+
+    local doneText, totalText = tostring(puzzleLabel.Text):match("[Pp]uzzles:%s*(%d+)%s*/%s*(%d+)")
+    return tonumber(doneText), tonumber(totalText)
+
+end
+
+local function getPuzzleProgress()
+
+    local share = ReplicatedStorage:FindFirstChild("Share")
+    local values = share and share:FindFirstChild("GameValues")
+    local doneValue = values and values:FindFirstChild("PuzzlesDone")
+    local totalValue = values and values:FindFirstChild("PuzzlesTotal")
+
+    if doneValue and totalValue then
+        local ok, done, total = pcall(function()
+            return doneValue.Value, totalValue.Value
+        end)
+        if ok and type(done) == "number" and type(total) == "number" then
+            return done, total
+        end
+    end
+
+    return getDisplayedPuzzleProgress()
+
+end
+
+local function getQuidzBalance()
+
+    local registry = getPlayerRegistry()
+    local data = registry and registry.PlayerData
+    local value = data and data.Quidz
+
+    if type(value) == "number" then
+        return value
+    end
+
+    local leaderstats = player:FindFirstChild("leaderstats")
+    local quidzValue = leaderstats and leaderstats:FindFirstChild("Quidz")
+    if quidzValue and (quidzValue:IsA("IntValue") or quidzValue:IsA("NumberValue")) then
+        return quidzValue.Value
+    end
+
+    return nil
+
+end
+
+local function capturePuzzleSnapshot()
+
+    local done, total = getPuzzleProgress()
+    local uiDone, uiTotal = getDisplayedPuzzleProgress()
+
+    return {
+        Done = done,
+        Total = total,
+        UIDone = uiDone,
+        UITotal = uiTotal,
+        Quidz = getQuidzBalance(),
+    }
+
+end
+
+local function puzzleSnapshotAdvanced(snapshot)
+
+    local done = getPuzzleProgress()
+    local uiDone = getDisplayedPuzzleProgress()
+    local quidz = getQuidzBalance()
+
+    if done and snapshot.Done and done > snapshot.Done then
+        return true
+    end
+
+    if uiDone and snapshot.UIDone and uiDone > snapshot.UIDone then
+        return true
+    end
+
+    if quidz and snapshot.Quidz and quidz > snapshot.Quidz then
+        return true
+    end
+
+    return false
+
+end
+
+local function allRoundPuzzlesComplete()
+
+    local done, total = getPuzzleProgress()
+    return type(done) == "number" and type(total) == "number" and total > 0 and done >= total
+
+end
+
+local function waitForPuzzleProgress(previousDone, timeout)
+
+    if type(previousDone) ~= "number" then
+        return false
+    end
+
+    local deadline = os.clock() + (timeout or 6)
+
+    repeat
+        local done = getPuzzleProgress()
+        if done and done > previousDone then
+            return true
+        end
+        task.wait(0.15)
+    until os.clock() >= deadline or not running
+
+    return false
+
+end
+
+-- The supplied ID was already used as an image/thumbnail asset in the older
+-- GHAVE script. Build a real collidable platform and display that image on top.
+local QUIDZ_PLATFORM_ASSET_ID = "71442609679676"
+local QUIDZ_FARM_POSITION = Vector3.new(427, 24, -27)
+local quidzPlatform = nil
+
+local function getQuidzTarget()
+
+    local lobby = workspace:FindFirstChild("Lobby")
+    local obby = lobby and lobby:FindFirstChild("_Obby")
+    local target = obby and obby:FindFirstChild("Quidz")
+
+    if target and target:IsA("BasePart") then
+        return target
+    end
+
+    return nil
+
+end
+
+local function ensureQuidzPlatform()
+
+    local targetPosition = QUIDZ_FARM_POSITION
+
+    if not (quidzPlatform and quidzPlatform.Parent) then
+
+        local platform = Instance.new("Part")
+        platform.Name = "GHAVE_QuidzPlatform"
+        platform.Size = Vector3.new(18, 1, 18)
+        platform.Anchored = true
+        platform.CanCollide = true
+        platform.CanTouch = false
+        platform.CanQuery = false
+        platform.Material = Enum.Material.SmoothPlastic
+        platform.Color = Color3.fromRGB(42, 48, 62)
+        platform.TopSurface = Enum.SurfaceType.Smooth
+        platform.BottomSurface = Enum.SurfaceType.Smooth
+
+        local surface = Instance.new("SurfaceGui")
+        surface.Name = "QuidzAssetSurface"
+        surface.Face = Enum.NormalId.Top
+        surface.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
+        surface.PixelsPerStud = 40
+        surface.LightInfluence = 0
+        surface.Parent = platform
+
+        local image = Instance.new("ImageLabel")
+        image.Name = "AssetImage"
+        image.BackgroundTransparency = 1
+        image.Size = UDim2.fromScale(1, 1)
+        image.Image = "rbxthumb://type=Asset&id=" .. QUIDZ_PLATFORM_ASSET_ID .. "&w=420&h=420"
+        image.ScaleType = Enum.ScaleType.Fit
+        image.Parent = surface
+
+        platform.Parent = workspace
+        quidzPlatform = platform
+
+    end
+
+    -- Preserve the original GHAVE farm position and keep the platform below it.
+    quidzPlatform.CFrame = CFrame.new(
+        targetPosition.X,
+        targetPosition.Y - 3.5,
+        targetPosition.Z
+    )
+
+    return quidzPlatform, targetPosition
+
+end
+
+-- ---------- NEVERLOSE UI LIBRARY ----------
+-- Load the requested Neverlose-inspired Roblox UI library. The gameplay
+-- modules below continue to use the original Options table and worker loops.
+local NEVERLOSE_LIBRARY_URL = "https://raw.githubusercontent.com/ImInsane-1337/neverlose-ui/refs/heads/main/source/library.lua"
+local mobileDetected = UserInputService.TouchEnabled == true
+
+local libraryLoaded, libraryResult = pcall(function()
+    local source = game:HttpGet(NEVERLOSE_LIBRARY_URL)
+
+    -- Some published/cached Neverlose builds reach the startup keybind and
+    -- floating-button callbacks before their Window:SetOpen method is usable.
+    -- Inject a direct visibility implementation inside Library:Window, before
+    -- those callbacks are registered. This also works on mobile.
+    local setOpenAnchor = '            Library:Connect(UserInputService.InputBegan, function(Input)\n                if tostring(Input.KeyCode) == Library.MenuKeybind or tostring(Input.UserInputType) == Library.MenuKeybind then'
+    local anchorStart, anchorEnd = source:find(setOpenAnchor, 1, true)
+    assert(anchorStart, "Neverlose source changed: Window:SetOpen compatibility anchor not found")
+    local setOpenShim = [[            function Window:SetOpen(Bool)
+                Window.IsOpen = Bool == true
+                local mainFrameItem = Items["MainFrame"]
+                local mainFrame = mainFrameItem and mainFrameItem.Instance
+                if mainFrame then
+                    mainFrame.Visible = Window.IsOpen
+                end
+            end
+
+]]
+    source = source:sub(1, anchorStart - 1) .. setOpenShim .. source:sub(anchorStart)
+
+    -- Guard the settings overlay's open-frame cleanup too. Only Window and
+    -- Settings objects expose SetOpen; ignore any non-window entry safely.
+    source = source:gsub(
+        'if Value ~= Settings then\n%s*Value:SetOpen%(false%)\n%s*end',
+        'if Value ~= Settings and type(Value.SetOpen) == "function" then\n                                    Value:SetOpen(false)\n                                end'
+    )
+
+    local compiler = loadstring
+    assert(type(compiler) == "function", "loadstring is unavailable")
+    local chunk, compileError = compiler(source)
+    assert(type(chunk) == "function", tostring(compileError or "Neverlose UI did not compile"))
+    return chunk()
+end)
+
+if not libraryLoaded or type(libraryResult) ~= "table" then
+    warn("[GHAVE][UI] Neverlose UI failed to load: " .. tostring(libraryResult))
+    pcall(function()
+        TintEffect.Enabled = false
+        TintEffect:Destroy()
+    end)
+    return
+end
+
+Library = libraryResult
+if type(Library.Window) ~= "function"
+    or type(Library.Page) ~= "function"
+    or type(Library.CreateSettingsPage) ~= "function"
+    or type(Library.Unload) ~= "function" then
+    warn("[GHAVE][UI] The downloaded Neverlose library is missing required API methods.")
+    pcall(function()
+        if Library.Unload then
+            Library:Unload()
+        end
+        TintEffect.Enabled = false
+        TintEffect:Destroy()
+    end)
+    return
+end
+libraryUnload = Library.Unload
+
+-- The built-in close button normally unloads only the UI. Route that action
+-- through this script's full cleanup so all farming workers stop as well.
+Library.Unload = function(self)
+    if unload and not shuttingDown then
+        unload()
+        return
+    end
+    if libraryUnload then
+        return libraryUnload(self)
+    end
+end
+
+local accentColor = Color3.fromRGB(94, 168, 255)
+local accentGradient = Color3.fromRGB(124, 103, 255)
+Library.Theme.Accent = accentColor
+Library.Theme.AccentGradient = accentGradient
+pcall(function() Library:ChangeTheme("Accent", accentColor) end)
+pcall(function() Library:ChangeTheme("AccentGradient", accentGradient) end)
+
+Library.Folders = {
+    Directory = "GHAVE_BEAR_Alpha",
+    Configs = "GHAVE_BEAR_Alpha/Configs",
+    Assets = "GHAVE_BEAR_Alpha/Assets"
+}
+
+-- The current library source reads this field directly. Setting the field
+-- explicitly also keeps the prior LeftAlt shortcut even on versions where
+-- Window's MenuKeybind constructor argument is ignored.
+Library.MenuKeybind = tostring(Enum.KeyCode.LeftAlt)
+
+Window = Library:Window({
+    Name = "GHAVE BEAR Alpha",
+    SubName = "AutoFarm  •  Puzzle Automation",
+    Logo = "120959262762131",
+    MenuKeybind = Enum.KeyCode.LeftAlt
+})
+
+local toggles = {}
+local sliders = {}
+local currentSections = {}
+local Pages = {}
+
+local function makePage(name, icon)
+    local data = { Name = name }
+    if icon then
+        data.Icon = icon
+    end
+    local page = Window:Page(data)
+    Pages[name] = page
+    return page
+end
+
+local function section(page, name, side)
+    local created = page:Section({
+        Name = name,
+        Side = side or 1
+    })
+    currentSections[page] = created
+    return created
+end
+
+local function resolveSection(pageOrSection)
+    return currentSections[pageOrSection] or pageOrSection
+end
+
+local function addToggle(pageOrSection, label, key, default, onChanged)
+    if Options[key] == nil then
+        Options[key] = default == true
+    end
+
+    local sectionObject = resolveSection(pageOrSection)
+    local toggle = sectionObject:Toggle({
+        Name = label,
+        Flag = "GHAVE_" .. key,
+        Default = Options[key] == true,
+        Callback = function(value)
+            Options[key] = value == true
+            if onChanged then
+                local ok, err = pcall(onChanged, Options[key])
+                if not ok then
+                    warn("[GHAVE][UI] " .. key .. " callback failed: " .. tostring(err))
+                end
+            end
+        end
+    })
+
+    toggles[key] = toggle
+    return toggle
+end
+
+local function addSlider(pageOrSection, label, key, minimum, maximum, default, map, onChanged, suffix)
+    Options[key] = map and map(default) or default
+
+    local sectionObject = resolveSection(pageOrSection)
+    local slider = sectionObject:Slider({
+        Name = label,
+        Flag = "GHAVE_" .. key,
+        Min = minimum,
+        Max = maximum,
+        Default = default,
+        Decimals = 1,
+        Suffix = suffix or "",
+        Callback = function(value)
+            Options[key] = map and map(value) or value
+            if onChanged then
+                local ok, err = pcall(onChanged, Options[key])
+                if not ok then
+                    warn("[GHAVE][UI] " .. key .. " slider callback failed: " .. tostring(err))
+                end
+            end
+        end
+    })
+
+    sliders[key] = slider
+    return slider
+end
+
+local function addButton(pageOrSection, label, callback)
+    local sectionObject = resolveSection(pageOrSection)
+    return sectionObject:Button({
+        Name = label,
+        Callback = callback
+    })
+end
+
+local function notify(titleText, bodyText)
+    local message = tostring(titleText or "Status")
+    if bodyText ~= nil then
+        message ..= "  •  " .. tostring(bodyText)
+    end
+
+    if statusLabel and statusLabel.SetText then
+        pcall(function()
+            statusLabel:SetText(message)
+        end)
+    else
+        print("[GHAVE] " .. message)
+    end
+end
+
+-- SERVER HOPPING
+-- The public-servers endpoint is queried through the executor's HTTP request
+-- function. Servers are ranked locally by their current player count.
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local SERVER_HOP_PAGE_LIMIT = 25
+local SERVER_HOP_COOLDOWN = 120
+local SERVER_HOP_RATE_LIMIT_BASE_COOLDOWN = 300
+local serverHopInProgress = false
+local serverHopCooldownUntil = 0
+local serverHopRateLimitCount = 0
+local visitedServerIds = {}
+
+local function getExecutorRequestFunction()
+    local env
+    pcall(function()
+        env = getgenv and getgenv() or _G
+    end)
+    env = env or _G
+
+    local ok, fn = pcall(function()
+        if env.syn and type(env.syn.request) == "function" then
+            return env.syn.request
+        end
+        if env.http and type(env.http.request) == "function" then
+            return env.http.request
+        end
+        if type(env.http_request) == "function" then
+            return env.http_request
+        end
+        if type(env.request) == "function" then
+            return env.request
+        end
+        if type(request) == "function" then
+            return request
+        end
+        return nil
+    end)
+
+    return ok and fn or nil
+end
+
+local function fetchPublicServerPage(mode)
+    local sortOrder = mode == "Highest" and "Desc" or "Asc"
+    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=%d&excludeFullGames=true")
+        :format(game.PlaceId, sortOrder, SERVER_HOP_PAGE_LIMIT)
+
+    local requestFunction = getExecutorRequestFunction()
+    local response
+    if requestFunction then
+        local requestOK, requestResult = pcall(requestFunction, {
+            Url = url,
+            Method = "GET",
+            Headers = { ["Accept"] = "application/json" }
+        })
+        if not requestOK then
+            local message = tostring(requestResult)
+            if message:find("429", 1, true) then
+                error("HTTP 429: Roblox rate-limited the public server list")
+            end
+            error(message)
+        end
+        response = requestResult
+    else
+        local requestOK, bodyOrError = pcall(function()
+            return HttpService:GetAsync(url, true)
+        end)
+        if not requestOK then
+            local message = tostring(bodyOrError)
+            if message:find("429", 1, true) then
+                error("HTTP 429: Roblox rate-limited the public server list")
+            end
+            error(message)
+        end
+        response = {
+            Body = bodyOrError,
+            StatusCode = 200,
+            Success = true
+        }
+    end
+
+    local statusCode = type(response) == "table"
+        and tonumber(response.StatusCode or response.status_code or response.Status)
+        or nil
+    if statusCode == 429 then
+        error("HTTP 429: Roblox rate-limited the public server list")
+    elseif statusCode and statusCode >= 400 then
+        error("Roblox server API returned HTTP " .. tostring(statusCode))
+    end
+    if type(response) == "table" and response.Success == false then
+        error("HTTP request failed" .. (statusCode and (" (" .. statusCode .. ")") or ""))
+    end
+
+    local body = type(response) == "string" and response
+        or (type(response) == "table" and (response.Body or response.body))
+    if type(body) ~= "string" then
+        error("HTTP response did not contain a response body")
+    end
+
+    local decodedOK, decoded = pcall(function()
+        return HttpService:JSONDecode(body)
+    end)
+    if not decodedOK or type(decoded) ~= "table" or type(decoded.data) ~= "table" then
+        error("Roblox server API returned an unexpected response")
+    end
+    return decoded
+end
+
+local function findTargetPublicServer(mode)
+    -- One ordered page only. Repeated cursor pagination was the source of the
+    -- previous burst of requests that resulted in HTTP 429.
+    local page = fetchPublicServerPage(mode)
+    local best = nil
+    local scanned = 0
+
+    for _, server in ipairs(page.data) do
+        scanned += 1
+        local id = server.id
+        local playing = tonumber(server.playing)
+        local maxPlayers = tonumber(server.maxPlayers)
+
+        if type(id) == "string"
+            and id ~= ""
+            and id ~= game.JobId
+            and not visitedServerIds[id]
+            and playing ~= nil
+            and maxPlayers ~= nil
+            and maxPlayers > 0
+            and playing < maxPlayers then
+
+            local fill = playing / maxPlayers
+            local better = not best
+            if best then
+                if mode == "Highest" then
+                    better = playing > best.Playing
+                        or (playing == best.Playing and fill > best.Fill)
+                else
+                    better = playing < best.Playing
+                        or (playing == best.Playing and fill < best.Fill)
+                end
+            end
+
+            if better then
+                best = {
+                    Id = id,
+                    Playing = playing,
+                    MaxPlayers = maxPlayers,
+                    Fill = fill
+                }
+            end
+        end
+    end
+
+    return best, scanned
+end
+
+local function getServerHopMode()
+    if Options.HopToHighestServer then
+        return "Highest"
+    elseif Options.HopToLowestServer then
+        return "Lowest"
+    end
+    return nil
+end
+
+local function performServerHop(reason)
+    if serverHopInProgress then
+        return false
+    end
+    local now = os.clock()
+    if now < serverHopCooldownUntil then
+        local remaining = math.max(1, math.ceil(serverHopCooldownUntil - now))
+        notify("Server Hop", "Cooldown — retry in " .. tostring(remaining) .. " seconds")
+        return false
+    end
+
+    local mode = getServerHopMode()
+    if not mode then
+        notify("Server Hop", "Choose Highest or Lowest server first")
+        return false
+    end
+
+    serverHopInProgress = true
+    serverHopCooldownUntil = os.clock() + SERVER_HOP_COOLDOWN
+    notify("Server Hop", "Searching one ordered server-list page for the " .. mode:lower() .. " population server" .. (reason and (" — " .. tostring(reason)) or "") .. "...")
+
+    task.spawn(function()
+        local ok, target, scanned = pcall(findTargetPublicServer, mode)
+        if not ok then
+            serverHopInProgress = false
+            local message = tostring(target)
+            warn("[GHAVE][Server Hop] Search failed: " .. message)
+            if message:find("429", 1, true) then
+                serverHopRateLimitCount = math.min(serverHopRateLimitCount + 1, 4)
+                local backoff = math.min(1200, SERVER_HOP_RATE_LIMIT_BASE_COOLDOWN * (2 ^ (serverHopRateLimitCount - 1)))
+                serverHopCooldownUntil = os.clock() + backoff
+                notify("Server Hop", "HTTP 429 rate limit — paused for " .. tostring(backoff) .. " seconds")
+            else
+                notify("Server Hop", "Search failed — paused for 120 seconds; check HTTP access")
+            end
+            return
+        end
+
+        if not running then
+            serverHopInProgress = false
+            return
+        end
+
+        if not target then
+            serverHopInProgress = false
+            serverHopRateLimitCount = 0
+            notify("Server Hop", "No eligible public server found in " .. tostring(scanned) .. " results")
+            return
+        end
+
+        local teleported, teleportError = pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, target.Id, player)
+        end)
+
+        if teleported then
+            serverHopRateLimitCount = 0
+            visitedServerIds[target.Id] = true
+            notify("Server Hop", ("Joining %s server (%d/%d players)"):format(
+                mode:lower(), target.Playing, target.MaxPlayers
+            ))
+        else
+            serverHopInProgress = false
+            serverHopCooldownUntil = os.clock() + SERVER_HOP_COOLDOWN
+            warn("[GHAVE][Server Hop] Teleport failed: " .. tostring(teleportError))
+            notify("Server Hop", "Teleport failed: " .. tostring(teleportError))
+        end
+    end)
+
+    return true
+end
+
+local function serverHopMonitorLoop()
+    while running do
+        local currentCount = #Players:GetPlayers()
+        local underLimit = math.max(1, math.floor(tonumber(Options.UnderPlayerCount) or 6))
+        local overLimit = math.max(1, math.floor(tonumber(Options.OverPlayerCount) or 10))
+
+        local underTriggered = Options.HopIfUnderPlayerCount and currentCount < underLimit
+        local overTriggered = Options.HopIfOverPlayerCount and currentCount > overLimit
+
+        if (underTriggered or overTriggered) and getServerHopMode()
+            and not serverHopInProgress and os.clock() >= serverHopCooldownUntil then
+            local reason = underTriggered
+                and ("Player count below " .. underLimit .. " (" .. currentCount .. ")")
+                or ("Player count above " .. overLimit .. " (" .. currentCount .. ")")
+            if performServerHop(reason) then
+                task.wait(5)
+            else
+                task.wait(5)
+            end
+        else
+            task.wait(5)
+        end
+    end
+
+    Threads.ServerHopMonitor = nil
+end
+
+-- Clear the in-progress flag if Roblox reports that the teleport did not start.
+pcall(function()
+    track(TeleportService.TeleportInitFailed:Connect(function(failedPlayer, result, errorMessage)
+        if failedPlayer == player then
+            serverHopInProgress = false
+            notify("Server Hop", "Teleport did not start: " .. tostring(errorMessage or result))
+        end
+    end))
+end)
+
+-- MAIN / LOBBY
+Window:Category("MAIN")
+local Lobby = makePage("Lobby")
+
+section(Lobby, "Automatic Farming", 1)
+addToggle(Lobby, "Full AutoFarm (Automatic Role Detection)", "AutoFarm", false)
+addToggle(Lobby, "Fling Bear After Puzzles", "FlingBearAfterPuzzles", true)
+currentSections[Lobby]:Label("After the puzzle queue, drives the lobby fling parts at the active Bear (center, front, and behind) until the round ends.")
+
+section(Lobby, "Lobby Utilities", 2)
+local QuidzToggle = addToggle(Lobby, "Quidz Lobby Farm", "Quidz", false)
+
+local lobbyStatusSection = section(Lobby, "Live Status", 1)
+statusLabel = lobbyStatusSection:Label(mobileDetected and "Ready — touch controls detected" or "Ready — desktop controls active")
+
+-- SERVER HOP
+Window:Category("SERVER HOP")
+local ServerHop = makePage("Server Hop")
+section(ServerHop, "Automatic Player Count Triggers", 1)
+addToggle(ServerHop, "Hop If Player Count Is Under", "HopIfUnderPlayerCount", false)
+addSlider(ServerHop, "Under Player Count", "UnderPlayerCount", 1, 50, 6, function(value)
+    return math.floor(value)
+end, nil, " players")
+addToggle(ServerHop, "Hop If Player Count Is Over", "HopIfOverPlayerCount", false)
+addSlider(ServerHop, "Over Player Count", "OverPlayerCount", 1, 50, 10, function(value)
+    return math.floor(value)
+end, nil, " players")
+currentSections[ServerHop]:Label("The hop starts when the current server goes strictly below or above the selected count.")
+
+section(ServerHop, "Destination Server", 2)
+local syncingHopMode = false
+addToggle(ServerHop, "Hop To Highest Player Count Server", "HopToHighestServer", true, function(enabled)
+    if syncingHopMode or not enabled then
+        return
+    end
+    syncingHopMode = true
+    if toggles.HopToLowestServer then
+        toggles.HopToLowestServer:Set(false)
+    else
+        Options.HopToLowestServer = false
+    end
+    syncingHopMode = false
+end)
+addToggle(ServerHop, "Hop To Lowest Player Count Server", "HopToLowestServer", false, function(enabled)
+    if syncingHopMode or not enabled then
+        return
+    end
+    syncingHopMode = true
+    if toggles.HopToHighestServer then
+        toggles.HopToHighestServer:Set(false)
+    else
+        Options.HopToHighestServer = false
+    end
+    syncingHopMode = false
+end)
+currentSections[ServerHop]:Label("Highest joins the most populated available server. Lowest joins the least populated available server.")
+addButton(ServerHop, "Hop Now", function()
+    if not performServerHop("Manual hop") then
+        if serverHopInProgress then
+            notify("Server Hop", "A hop is already in progress")
+        end
+    end
+end)
+
+-- PUZZLES: all puzzle automation, including Memory / VHS, lives on this page.
+Window:Category("AUTOMATION")
+local Puzzles = makePage("Puzzles")
+local Memory = Puzzles -- Compatibility alias for the existing Memory action callbacks.
+
+local puzzleQueueSection = section(Puzzles, "Puzzle Queue", 1)
+puzzleQueueSection:Label("Survivor order: Wires → Cheese Altar → Color Code → Memory / VHS → Smoke → Pink Squash → Painting")
+addToggle(Puzzles, "Sequential Puzzle Queue", "AutoPuzzles", false)
+
+section(Puzzles, "Wire Puzzle", 1)
+local syncingWireToggles = false
+
+addToggle(Puzzles, "Wire Teleport Farm", "Wires", false, function(enabled)
+    if syncingWireToggles then
+        return
+    end
+
+    syncingWireToggles = true
+    if toggles.Nearest then
+        toggles.Nearest:Set(enabled)
+    else
+        Options.Nearest = enabled
+    end
+    syncingWireToggles = false
+end)
+
+addToggle(Puzzles, "Nearest Wire Fire", "Nearest", false, function(enabled)
+    if syncingWireToggles then
+        return
+    end
+
+    syncingWireToggles = true
+    if toggles.Wires then
+        toggles.Wires:Set(enabled)
+    else
+        Options.Wires = enabled
+    end
+    syncingWireToggles = false
+end)
+
+addSlider(Puzzles, "Nearest Wire Search Range", "NearestRange", 10, 200, 50, nil, nil, " studs")
+
+section(Puzzles, "Automatic Puzzle Solvers", 2)
+addToggle(Puzzles, "Automatic Color Code Solver", "ColorCode", false)
+addToggle(Puzzles, "Automatic Memory / VHS Solver", "Memory", false)
+
+section(Puzzles, "Puzzle Actions", 2)
+
+-- SURVIVOR: intentionally limited to Infinite Stamina for this build.
+Window:Category("SURVIVOR")
+local Survivor = makePage("Survivor")
+section(Survivor, "Movement", 1)
+addToggle(Survivor, "Infinite Stamina", "Stamina", false)
+section(Survivor, "Early Access", 2)
+addToggle(Survivor, "Get Spectate Button Early", "GetSpectateButtonEarly", true)
+section(Survivor, "Coming Next", 2):Label("More Survivor modules will be added here.")
+
+-- BEAR
+Window:Category("BEAR")
+local Bear = makePage("Bear")
+section(Bear, "Combat", 1)
+addToggle(Bear, "Kill All ", "KillAll", false)
+addSlider(Bear, "kill all Delay", "KillDelay", 5, 40, 12, function(value)
+    return value / 100
+end)
+
+-- VISUALS
+Window:Category("VISUALS")
+local Visuals = makePage("Visuals")
+section(Visuals, "Player ESP", 1)
+addToggle(Visuals, "Enable Player ESP", "Esp", false)
+addToggle(Visuals, "Corner Box Outlines", "Boxes", true)
+addToggle(Visuals, "Player Names and Team Labels", "Names", true)
+addToggle(Visuals, "Player Chams", "Chams", true)
+addToggle(Visuals, "Player Health Bars", "Health", true)
+
+section(Visuals, "Camera Controls", 2)
+addToggle(Visuals, "Unlock Maximum Zoom Distance", "UncapZoom", false, applyCameraSettings)
+addToggle(Visuals, "Disable Forced First-Person Lock", "DisableForcedFirstPerson", true, applyCameraSettings)
+
+section(Visuals, "Screen Tint", 2)
+addToggle(Visuals, "Enable Screen Tint", "Tint", false, updateTintEffect)
+addSlider(Visuals, "Tint Red", "TintR", 0, 255, 255, nil, updateTintEffect)
+addSlider(Visuals, "Tint Green", "TintG", 0, 255, 255, nil, updateTintEffect)
+addSlider(Visuals, "Tint Blue", "TintB", 0, 255, 255, nil, updateTintEffect)
+addSlider(Visuals, "Tint Intensity", "TintIntensity", 0, 100, 50, function(value)
+    return value / 100
+end, updateTintEffect, "%")
+updateTintEffect()
+
+-- Config persistence uses the library's built-in config manager. Its own
+-- Create/Load/Save/Delete controls remain in Settings; the additional page
+-- below stores a selected autoload file independently of each config.
+pcall(function()
+    if type(isfolder) == "function" and type(makefolder) == "function" then
+        if not isfolder(Library.Folders.Directory) then
+            makefolder(Library.Folders.Directory)
+        end
+        if not isfolder(Library.Folders.Configs) then
+            makefolder(Library.Folders.Configs)
+        end
+        if not isfolder(Library.Folders.Assets) then
+            makefolder(Library.Folders.Assets)
+        end
+    end
+end)
+
+local AUTOLOAD_SETTINGS_PATH = Library.Folders.Directory .. "/autoload.json"
+local AUTOLOAD_DROPDOWN_FLAG = "GHAVE_AutoLoadConfigSelect"
+local AUTOLOAD_TOGGLE_FLAG = "GHAVE_AutoLoadConfigEnabled"
+local autoLoadSettings = {
+    Enabled = false,
+    Config = nil,
+}
+
+local function getConfigFilePath(configName)
+    if type(configName) ~= "string" or configName == "" then
+        return nil
+    end
+    if string.find(configName, "[/\\]") or not string.match(configName, "%.json$") then
+        return nil
+    end
+    return Library.Folders.Configs .. "/" .. configName
+end
+
+local function getAvailableConfigNames()
+    local names = {}
+    if type(listfiles) ~= "function" or type(isfolder) ~= "function" then
+        return names
+    end
+
+    local ok, files = pcall(listfiles, Library.Folders.Configs)
+    if not ok or type(files) ~= "table" then
+        return names
+    end
+
+    for _, filePath in ipairs(files) do
+        local fileName = tostring(filePath):match("[^/\\]+$")
+        if fileName and fileName:match("%.json$") then
+            table.insert(names, fileName)
+        end
+    end
+
+    table.sort(names)
+    return names
+end
+
+local function readAutoLoadSettings()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" then
+        return
+    end
+    local okFile, exists = pcall(isfile, AUTOLOAD_SETTINGS_PATH)
+    if not okFile or not exists then
+        return
+    end
+
+    local okRead, contents = pcall(readfile, AUTOLOAD_SETTINGS_PATH)
+    if not okRead or type(contents) ~= "string" then
+        return
+    end
+
+    local okDecode, decoded = pcall(function()
+        return HttpService:JSONDecode(contents)
+    end)
+    if okDecode and type(decoded) == "table" then
+        autoLoadSettings.Enabled = decoded.Enabled == true
+        autoLoadSettings.Config = type(decoded.Config) == "string" and decoded.Config or nil
+    end
+end
+
+local function saveAutoLoadSettings()
+    if type(writefile) ~= "function" then
+        return false
+    end
+
+    local ok, err = pcall(function()
+        writefile(AUTOLOAD_SETTINGS_PATH, HttpService:JSONEncode({
+            Enabled = autoLoadSettings.Enabled == true,
+            Config = autoLoadSettings.Config,
+        }))
+    end)
+    if not ok then
+        warn("[GHAVE][Config] Could not save autoload selection: " .. tostring(err))
+    end
+    return ok
+end
+
+readAutoLoadSettings()
+local initialConfigNames = getAvailableConfigNames()
+local function containsConfig(list, target)
+    if not target then
+        return false
+    end
+    for _, value in ipairs(list) do
+        if value == target then
+            return true
+        end
+    end
+    return false
+end
+
+if not containsConfig(initialConfigNames, autoLoadSettings.Config)
+    or not getConfigFilePath(autoLoadSettings.Config) then
+    autoLoadSettings.Config = nil
+    autoLoadSettings.Enabled = false
+end
+
+-- The autoload selector is metadata, not part of the user's actual gameplay
+-- config. Exclude its two UI flags from config save/load operations.
+local originalGetConfig = Library.GetConfig
+if type(originalGetConfig) == "function" then
+    Library.GetConfig = function(self)
+        local encoded = originalGetConfig(self)
+        if type(encoded) ~= "string" then
+            return encoded
+        end
+        local ok, decoded = pcall(function()
+            return HttpService:JSONDecode(encoded)
+        end)
+        if ok and type(decoded) == "table" then
+            decoded[AUTOLOAD_DROPDOWN_FLAG] = nil
+            decoded[AUTOLOAD_TOGGLE_FLAG] = nil
+            return HttpService:JSONEncode(decoded)
+        end
+        return encoded
+    end
+end
+
+local originalLoadConfig = Library.LoadConfig
+if type(originalLoadConfig) == "function" then
+    Library.LoadConfig = function(self, encoded)
+        if type(encoded) == "string" then
+            local ok, decoded = pcall(function()
+                return HttpService:JSONDecode(encoded)
+            end)
+            if ok and type(decoded) == "table" then
+                decoded[AUTOLOAD_DROPDOWN_FLAG] = nil
+                decoded[AUTOLOAD_TOGGLE_FLAG] = nil
+                encoded = HttpService:JSONEncode(decoded)
+            end
+        end
+        return originalLoadConfig(self, encoded)
+    end
+end
+
+Window:Category("SETTINGS")
+local settingsOk, settingsError = pcall(function()
+    Library:CreateSettingsPage(Window)
+end)
+if not settingsOk then
+    warn("[GHAVE][UI] Optional Neverlose settings page unavailable: " .. tostring(settingsError))
+end
+
+local AutoLoadPage = makePage("Auto Load")
+local autoLoadSection = section(AutoLoadPage, "Config Autoload", 1)
+autoLoadSection:Label("Create, save, and manage config files in the built-in Settings page.")
+
+local suppressAutoLoadPersistence = true
+local autoLoadToggle
+local autoLoadDropdown = autoLoadSection:Dropdown({
+    Name = "Config",
+    Flag = AUTOLOAD_DROPDOWN_FLAG,
+    Items = initialConfigNames,
+    Multi = false,
+    Default = autoLoadSettings.Config,
+    Callback = function(value)
+        if suppressAutoLoadPersistence then
+            return
+        end
+        autoLoadSettings.Config = type(value) == "string" and value or nil
+        if autoLoadSettings.Enabled and not getConfigFilePath(autoLoadSettings.Config) then
+            autoLoadSettings.Enabled = false
+            suppressAutoLoadPersistence = true
+            pcall(function()
+                autoLoadToggle:Set(false)
+            end)
+            suppressAutoLoadPersistence = false
+        end
+        saveAutoLoadSettings()
+    end,
+})
+
+autoLoadToggle = autoLoadSection:Toggle({
+    Name = "Auto Load Selected Config",
+    Flag = AUTOLOAD_TOGGLE_FLAG,
+    Default = autoLoadSettings.Enabled,
+    Callback = function(enabled)
+        if suppressAutoLoadPersistence then
+            return
+        end
+
+        local configPath = getConfigFilePath(autoLoadSettings.Config)
+        local exists = false
+        if configPath and type(isfile) == "function" then
+            local ok, result = pcall(isfile, configPath)
+            exists = ok and result == true
+        end
+
+        if enabled and not exists then
+            autoLoadSettings.Enabled = false
+            suppressAutoLoadPersistence = true
+            pcall(function()
+                autoLoadToggle:Set(false)
+            end)
+            suppressAutoLoadPersistence = false
+            notify("Config", "Select an existing config before enabling autoload")
+            saveAutoLoadSettings()
+            return
+        end
+
+        autoLoadSettings.Enabled = enabled == true
+        saveAutoLoadSettings()
+        notify("Config", autoLoadSettings.Enabled and "Autoload enabled for " .. tostring(autoLoadSettings.Config)
+            or "Autoload disabled")
+    end,
+})
+suppressAutoLoadPersistence = false
+
+local function refreshAutoLoadConfigList()
+    local names = getAvailableConfigNames()
+    local selected = autoLoadSettings.Config
+    suppressAutoLoadPersistence = true
+    pcall(function()
+        autoLoadDropdown:Refresh(names)
+        if containsConfig(names, selected) then
+            autoLoadDropdown:Set(selected)
+        else
+            autoLoadSettings.Config = nil
+            if autoLoadSettings.Enabled then
+                autoLoadSettings.Enabled = false
+                autoLoadToggle:Set(false)
+            end
+        end
+    end)
+    suppressAutoLoadPersistence = false
+    saveAutoLoadSettings()
+    notify("Config", tostring(#names) .. " config(s) available")
+end
+
+addButton(AutoLoadPage, "Refresh Config List", refreshAutoLoadConfigList)
+
+-- Keep the autoload dropdown in sync when the built-in Settings page creates,
+-- saves, deletes, or refreshes a config.
+local originalRefreshConfigsList = Library.RefreshConfigsList
+if type(originalRefreshConfigsList) == "function" then
+    Library.RefreshConfigsList = function(self, element)
+        local result = originalRefreshConfigsList(self, element)
+        task.defer(refreshAutoLoadConfigList)
+        return result
+    end
+end
+
+addButton(Puzzles, "Teleport to Color Code Question", function()
+
+    local hrp = getHRP()
+
+    local bin = workspace:FindFirstChild("PuzzleBin")
+
+    local target = bin
+
+        and bin:FindFirstChild("ColorCode")
+
+        and bin.ColorCode:FindFirstChild("Decor")
+
+        and bin.ColorCode.Decor:FindFirstChild("Question")
+
+    if hrp and target then
+
+        hrp.CFrame = target.CFrame * CFrame.new(0, 5, 0)
+
+    else
+
+        notify("ColorCode", "Question not found")
+
+    end
+
+end)
+
+-- ---------- SURVIVOR PUZZLE BUTTONS (Pink Squash / Painting / Smoke) ----------
+local function rotationNear(rot, target)
+    -- Compare Euler angles modulo 360 so values such as -90 and 270 match.
+    local function angleDifference(a, b)
+        return math.abs((a - b + 180) % 360 - 180)
+    end
+
+    return angleDifference(rot.X, target.X) < 2
+        and angleDifference(rot.Y, target.Y) < 2
+        and angleDifference(rot.Z, target.Z) < 2
+end
+
+local function tpClick(hrp, part, cd)
+    if not (hrp and part and part:IsA("BasePart")) then
+        return false
+    end
+    hrp.CFrame = part.CFrame * CFrame.new(0, 3, 2)
+    task.wait(0.12)
+    if cd and fireclickdetector then
+        fireclickdetector(cd)
+        return true
+    end
+    if firetouchinterest then
+        firetouchinterest(hrp, part, 0)
+        task.wait()
+        firetouchinterest(hrp, part, 1)
+        return true
+    end
+    return false
+end
+
+local puzzleBusy = {}
+
+local function runPuzzle(key, fn)
+
+    if puzzleBusy[key] then
+
+        return
+
+    end
+
+    puzzleBusy[key] = true
+
+    local ok, result = pcall(fn)
+
+    puzzleBusy[key] = nil
+
+    if not ok then
+
+        notify(key, "Error: " .. tostring(result))
+
+    elseif result == false then
+
+        notify(key, "Not completed — one attempt finished")
+
+    elseif result == true then
+
+        notify(key, "Completed")
+
+    end
+
+end
+
+local function getPinkSquashRoots()
+    local roots = {}
+    local seen = {}
+    local bin = workspace:FindFirstChild("PuzzleBin")
+    local map = workspace:FindFirstChild("Map")
+
+    local function addRoot(parent)
+        if not parent then
+            return
+        end
+        for _, child in ipairs(parent:GetChildren()) do
+            local name = string.lower(child.Name)
+            if (name == "pinksquash" or name == "pink_squash" or name == "pink squash")
+                and not seen[child] then
+                seen[child] = true
+                table.insert(roots, child)
+            end
+        end
+    end
+
+    addRoot(bin)
+    addRoot(map)
+    return roots
+end
+
+local function pinkSquashTargetPart(interaction, root)
+    local current = interaction and interaction.Parent
+    while current and current ~= root do
+        if current:IsA("BasePart") then
+            return current
+        end
+        current = current.Parent
+    end
+
+    local model = interaction and interaction:FindFirstAncestorWhichIsA("Model")
+    if model and model ~= root then
+        if model.PrimaryPart then
+            return model.PrimaryPart
+        end
+        local part = model:FindFirstChildWhichIsA("BasePart", true)
+        if part then
+            return part
+        end
+    end
+
+    return nil
+end
+
+local function pinkSquashNameMatches(instance, root)
+    local current = instance
+    while current and current ~= root do
+        local name = string.lower(current.Name)
+        if name == "pink" or name:find("pink", 1, true)
+            or name:find("squash", 1, true) or name:find("piece", 1, true) then
+            return true
+        end
+        current = current.Parent
+    end
+    return false
+end
+
+local function collectPinkSquashTargets()
+    local targets = {}
+    local seen = {}
+    local roots = getPinkSquashRoots()
+
+    for _, root in ipairs(roots) do
+        for _, descendant in ipairs(root:GetDescendants()) do
+            -- Pink Squash completion is specifically signalled by the game
+            -- removing this ClickDetector. Do not treat prompts, touch parts,
+            -- disabled detectors, or a successful executor call as completion.
+            if descendant:IsA("ClickDetector") and descendant.Parent
+                and not seen[descendant] then
+                local part = pinkSquashTargetPart(descendant, root)
+                if not part and descendant.Parent:IsA("BasePart") then
+                    part = descendant.Parent
+                end
+                if part and part:IsA("BasePart") then
+                    seen[descendant] = true
+                    table.insert(targets, {
+                        Id = descendant,
+                        Part = part,
+                        Detector = descendant,
+                    })
+                end
+            end
+        end
+    end
+
+    table.sort(targets, function(a, b)
+        local an = a.Part and a.Part:GetFullName() or ""
+        local bn = b.Part and b.Part:GetFullName() or ""
+        if an == bn then
+            return tostring(a.Id) < tostring(b.Id)
+        end
+        return an < bn
+    end)
+    return targets
+end
+
+local function pinkSquashTargetActive(target)
+    local detector = target and target.Detector
+    return detector ~= nil
+        and detector.Parent ~= nil
+        and detector:IsDescendantOf(workspace)
+end
+
+local function activatePinkSquashTarget(target, hrp)
+    if not (target and target.Part and target.Part.Parent and hrp
+        and target.Detector and target.Detector.Parent and fireclickdetector) then
+        return false
+    end
+
+    local moved = pcall(function()
+        hrp.CFrame = target.Part.CFrame * CFrame.new(0, 3, 0)
+    end)
+    if not moved then
+        return false
+    end
+
+    task.wait(0.15)
+    -- The only interaction used for Pink Squash is fireclickdetector.
+    return pcall(fireclickdetector, target.Detector)
+end
+
+local function solvePinkSquash()
+    local hadTargets = false
+
+    while running and isSurvivor() do
+        local targets = collectPinkSquashTargets()
+        local target = targets[1]
+
+        if not target then
+            if hadTargets then
+                -- Every ClickDetector previously exposed by Pink Squash has
+                -- disappeared from the live Workspace tree.
+                return true
+            end
+            task.wait(0.2)
+            continue
+        end
+
+        hadTargets = true
+        while running and isSurvivor() and pinkSquashTargetActive(target) do
+            local hrp = getHRP()
+            if not hrp then
+                task.wait(0.2)
+                continue
+            end
+            if not activatePinkSquashTarget(target, hrp) then
+                task.wait(0.35)
+            else
+                -- Keep retrying this same detector until the server removes
+                -- it; only then select the next piece.
+                local checkUntil = os.clock() + 0.45
+                repeat
+                    task.wait(0.05)
+                until not pinkSquashTargetActive(target) or os.clock() >= checkUntil
+            end
+        end
+    end
+
+    return false
+end
+
+local paintingSafetyPlatform = nil
+
+local function ensurePaintingSafetyPlatform(playerPosition)
+    if not (playerPosition and typeof(playerPosition) == "Vector3") then
+        return nil
+    end
+
+    if not (paintingSafetyPlatform and paintingSafetyPlatform.Parent) then
+        local platform = Instance.new("Part")
+        platform.Name = "GHAVE_PaintingSafetyPlatform"
+        platform.Size = Vector3.new(14, 1, 14)
+        platform.Anchored = true
+        platform.CanCollide = true
+        platform.CanTouch = false
+        platform.CanQuery = false
+        platform.Material = Enum.Material.SmoothPlastic
+        platform.Color = Color3.fromRGB(42, 48, 62)
+        platform.TopSurface = Enum.SurfaceType.Smooth
+        platform.BottomSurface = Enum.SurfaceType.Smooth
+        platform.Parent = workspace
+        paintingSafetyPlatform = platform
+    end
+
+    -- Keep the floor directly beneath the local root at every picture.
+    paintingSafetyPlatform.CFrame = CFrame.new(
+        playerPosition.X,
+        playerPosition.Y - 3.5,
+        playerPosition.Z
+    )
+    return paintingSafetyPlatform
+end
+
+local function destroyPaintingSafetyPlatform()
+    if paintingSafetyPlatform then
+        pcall(function() paintingSafetyPlatform:Destroy() end)
+        paintingSafetyPlatform = nil
+    end
+end
+
+local PAINTING_SOLVED_ROTATIONS = {
+    -- Retained as legacy GHAVE orientation candidates, not confirmed target data.
+    -- The decompiler lists PaintingVariants.Default but does not expose the
+    -- puzzle's client-side target-orientation implementation.
+    Vector3.new(0, 0, 0),
+    Vector3.new(0, 90, 0),
+    Vector3.new(180, 0, 180),
+}
+
+local function getPaintingExpectedRotation(model, part)
+    -- Prefer explicit target data when the live map model supplies it.
+    for _, attributeName in ipairs({"SolvedRotation", "CorrectRotation", "TargetRotation"}) do
+        local value = part:GetAttribute(attributeName)
+        if value == nil then
+            value = model:GetAttribute(attributeName)
+        end
+
+        if typeof(value) == "Vector3" then
+            return value
+        elseif typeof(value) == "CFrame" then
+            local x, y, z = value:ToOrientation()
+            return Vector3.new(math.deg(x), math.deg(y), math.deg(z))
+        end
+    end
+
+    return nil
+end
+
+local function paintingIsSolved(model, part)
+    local explicitTarget = getPaintingExpectedRotation(model, part)
+    if explicitTarget then
+        return rotationNear(part.Rotation, explicitTarget)
+    end
+
+    for _, target in ipairs(PAINTING_SOLVED_ROTATIONS) do
+        if rotationNear(part.Rotation, target) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function solvePainting()
+    local map = workspace:FindFirstChild("Map")
+    local painting = map and map:FindFirstChild("Painting")
+    local models = painting and painting:FindFirstChild("Models")
+    if not models then
+        return false
+    end
+
+    local list = models:GetChildren()
+    table.sort(list, function(a, b)
+        return a.Name < b.Name
+    end)
+
+    local foundPainting = false
+    local allSolved = true
+
+    for _, model in ipairs(list) do
+        if not running or not isSurvivor() then
+            destroyPaintingSafetyPlatform()
+            return false
+        end
+
+        local part = model:FindFirstChild("Painting", true)
+        if part and part:IsA("BasePart") then
+            foundPainting = true
+
+            if not paintingIsSolved(model, part) then
+                local hrp = getHRP()
+                if not hrp then
+                    destroyPaintingSafetyPlatform()
+                    return false
+                end
+
+                -- Create a Quidz-style anchored floor before teleporting to the
+                -- picture. Reposition it for each painting so the player cannot
+                -- drop into a void while rotating an image (including Final Hour).
+                local paintingStandCFrame = part.CFrame * CFrame.new(0, 2, 3)
+                ensurePaintingSafetyPlatform(paintingStandCFrame.Position)
+                hrp.CFrame = paintingStandCFrame
+                task.wait(0.18)
+                hrp = getHRP()
+                if hrp then
+                    ensurePaintingSafetyPlatform(hrp.Position)
+                end
+
+                local detectors = {}
+                for _, descendant in ipairs(model:GetDescendants()) do
+                    if descendant:IsA("ClickDetector") and descendant.Parent then
+                        table.insert(detectors, descendant)
+                    end
+                end
+
+                if #detectors == 0 then
+                    allSolved = false
+                else
+                    local solved = false
+                    local maxClicks = math.max(8, #detectors * 4)
+
+                    for clickIndex = 1, maxClicks do
+                        if not running or not isSurvivor() or not part.Parent then
+                            break
+                        end
+
+                        if paintingIsSolved(model, part) then
+                            solved = true
+                            break
+                        end
+
+                        hrp = getHRP()
+                        if hrp then
+                            ensurePaintingSafetyPlatform(hrp.Position)
+                        end
+
+                        local detector = detectors[((clickIndex - 1) % #detectors) + 1]
+                        local previousRotation = part.Rotation
+                        if detector and detector.Parent and fireclickdetector then
+                            pcall(fireclickdetector, detector)
+                        elseif detector and detector.Parent and firetouchinterest then
+                            local detectorPart = detector.Parent
+                            if detectorPart:IsA("BasePart") then
+                                pcall(function()
+                                    firetouchinterest(hrp, detectorPart, 0)
+                                    task.wait(0.06)
+                                    firetouchinterest(hrp, detectorPart, 1)
+                                end)
+                            end
+                        else
+                            break
+                        end
+
+                        -- Wait for the server's rotation replication before
+                        -- attempting another turn on this same picture.
+                        local changeDeadline = os.clock() + 0.65
+                        repeat
+                            task.wait(0.05)
+                            if not part.Parent then
+                                break
+                            end
+                            if (part.Rotation - previousRotation).Magnitude > 0.5 then
+                                break
+                            end
+                        until os.clock() >= changeDeadline
+
+                        if part.Parent and paintingIsSolved(model, part) then
+                            solved = true
+                            break
+                        end
+                    end
+
+                    if not solved and part.Parent then
+                        solved = paintingIsSolved(model, part)
+                    end
+
+                    if not solved then
+                        allSolved = false
+                    end
+                end
+
+                task.wait(0.12)
+            end
+        end
+    end
+
+    local result = foundPainting and allSolved
+    destroyPaintingSafetyPlatform()
+    return result
+end
+
+local function solveSmoke()
+    local function hasSmokeInteractions(root)
+        if not root then
+            return false
+        end
+        for _, descendant in ipairs(root:GetDescendants()) do
+            if descendant:IsA("ProximityPrompt") and descendant.Parent and descendant.Enabled then
+                return true
+            elseif descendant:IsA("ClickDetector") and descendant.Parent and descendant.MaxActivationDistance > 0 then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function getSmokeRoot()
+        local map = workspace:FindFirstChild("Map")
+        local bin = workspace:FindFirstChild("PuzzleBin")
+        local mapRoot = map and map:FindFirstChild("Smoke")
+        local binRoot = bin and bin:FindFirstChild("Smoke")
+
+        -- Prefer whichever tree currently contains an active proximity prompt.
+        local function hasActivePrompt(root)
+            if not root then
+                return false
+            end
+            for _, descendant in ipairs(root:GetDescendants()) do
+                if descendant:IsA("ProximityPrompt") and descendant.Parent and descendant.Enabled then
+                    return true
+                end
+            end
+            return false
+        end
+
+        if hasActivePrompt(mapRoot) then
+            return mapRoot
+        elseif hasActivePrompt(binRoot) then
+            return binRoot
+        elseif hasSmokeInteractions(mapRoot) then
+            return mapRoot
+        elseif hasSmokeInteractions(binRoot) then
+            return binRoot
+        end
+
+        return mapRoot or binRoot
+    end
+
+    local function isAvailable(interactable)
+        if not (interactable and interactable.Parent) then
+            return false
+        end
+        if interactable:IsA("ProximityPrompt") then
+            return interactable.Enabled
+        elseif interactable:IsA("ClickDetector") then
+            return interactable.MaxActivationDistance > 0
+        end
+        return false
+    end
+
+    local function findPartFor(interactable, root)
+        local current = interactable.Parent
+        while current and current ~= root do
+            if current:IsA("BasePart") then
+                return current
+            end
+            current = current.Parent
+        end
+
+        local model = interactable:FindFirstAncestorWhichIsA("Model")
+        if model then
+            if model.PrimaryPart then
+                return model.PrimaryPart
+            end
+            local modelPart = model:FindFirstChildWhichIsA("BasePart", true)
+            if modelPart then
+                return modelPart
+            end
+        end
+
+        return root and root:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    local function findNextInteractable(root, processed)
+        if not root then
+            return nil
+        end
+
+        local promptsExist = false
+        for _, descendant in ipairs(root:GetDescendants()) do
+            if descendant:IsA("ProximityPrompt") then
+                promptsExist = true
+                if not processed[descendant] and isAvailable(descendant) then
+                    return descendant
+                end
+            end
+        end
+
+        -- When this Smoke setup uses ProximityPrompts, wait for each prompt to
+        -- disable and then advance to the next prompt. Do not re-process stale
+        -- ClickDetectors attached to the same smoke props.
+        if promptsExist then
+            return nil
+        end
+
+        for _, descendant in ipairs(root:GetDescendants()) do
+            if descendant:IsA("ClickDetector")
+                and not processed[descendant]
+                and isAvailable(descendant) then
+                return descendant
+            end
+        end
+
+        return nil
+    end
+
+    local processed = {}
+    local actionCount = 0
+    local hadActiveEntry = false
+    local noActiveSince = nil
+    local overallDeadline = os.clock() + 210
+
+    while running and isSurvivor() and os.clock() < overallDeadline do
+        local root = getSmokeRoot()
+        local nextInteractable = findNextInteractable(root, processed)
+
+        if not nextInteractable then
+            noActiveSince = noActiveSince or os.clock()
+            local quietFor = os.clock() - noActiveSince
+
+            if hadActiveEntry and quietFor >= 2.5 then
+                break
+            elseif not hadActiveEntry and quietFor >= 15 then
+                -- PuzzleBin can create the marker before its interactables stream.
+                -- Return failure so the outer queue rescans instead of skipping it.
+                return false
+            end
+
+            task.wait(0.15)
+            continue
+        end
+
+        noActiveSince = nil
+        hadActiveEntry = true
+        processed[nextInteractable] = true
+
+        local part = findPartFor(nextInteractable, root)
+        local hrp = getHRP()
+        if not (part and hrp) then
+            return false
+        end
+
+        -- Teleport to exactly one smoke item and keep firing its prompt until
+        -- that prompt is disabled/removed. Only then search for the next one.
+        pcall(function()
+            hrp.CFrame = part.CFrame * CFrame.new(0, 3, 2)
+        end)
+        task.wait(0.15)
+
+        local itemDeadline = os.clock() + 35
+        local failedAttempts = 0
+
+        while running and isSurvivor()
+            and isAvailable(nextInteractable)
+            and os.clock() < itemDeadline do
+
+            local fired = false
+            if nextInteractable:IsA("ProximityPrompt") then
+                if fireproximityprompt then
+                    local ok = pcall(fireproximityprompt, nextInteractable)
+                    fired = ok
+                end
+
+                -- Fallback still holds the same prompt for its full configured
+                -- duration; it does not abandon the current smoke early.
+                if not fired then
+                    local ok = pcall(function()
+                        nextInteractable:InputHoldBegin()
+                        task.wait(math.max(nextInteractable.HoldDuration, 0.05) + 0.05)
+                        nextInteractable:InputHoldEnd()
+                    end)
+                    fired = ok
+                end
+            elseif nextInteractable:IsA("ClickDetector") and fireclickdetector then
+                fired = pcall(fireclickdetector, nextInteractable)
+            end
+
+            if fired then
+                actionCount += 1
+                failedAttempts = 0
+            else
+                failedAttempts += 1
+                if failedAttempts >= 4 then
+                    break
+                end
+            end
+
+            -- Rapidly repeat the current prompt until the game disables it.
+            task.wait(0.06)
+        end
+
+        if isAvailable(nextInteractable) then
+            warn("[GHAVE][Smoke] Prompt did not deactivate: " .. nextInteractable:GetFullName())
+            return false
+        end
+
+        -- Allow the puzzle to update before the next item is selected.
+        task.wait(0.18)
+    end
+
+    return actionCount > 0 or not hadActiveEntry
+end
+
+local function solveCheeseAltar(autoFarmRetry)
+
+    local bin = workspace:FindFirstChild("PuzzleBin")
+    local altarFolder = bin and bin:FindFirstChild("CheeseAltar")
+    local items = altarFolder and altarFolder:FindFirstChild("Items")
+    local cheesePart = items and items:FindFirstChild("Part")
+    local rootPart = altarFolder and altarFolder:FindFirstChild("RootPart")
+    local hrp = getHRP()
+
+    -- Keep waiting for the altar/character to stream in; a missing first
+    -- lookup is not a failed attempt and must not end the AutoFarm stage.
+    local snapshot = capturePuzzleSnapshot()
+    local retryDuringAutoFarm = autoFarmRetry == true
+    local sawAltarMarker = altarFolder ~= nil and cheesePart ~= nil and cheesePart:IsA("BasePart")
+
+    local function altarNoLongerAvailable()
+        local currentBin = workspace:FindFirstChild("PuzzleBin")
+        local currentFolder = currentBin and currentBin:FindFirstChild("CheeseAltar")
+        local currentItems = currentFolder and currentFolder:FindFirstChild("Items")
+        local currentPart = currentItems and currentItems:FindFirstChild("Part")
+        if currentFolder and currentPart and currentPart:IsA("BasePart") then
+            sawAltarMarker = true
+            return false
+        end
+
+        -- Do not mistake a not-yet-streamed marker for a completed altar.
+        -- Only disappearance after the altar was actually observed counts.
+        return sawAltarMarker
+    end
+
+    -- Teleports are attempted more than once because the server can correct a
+    -- client-side character position. Do not proceed to the altar until the
+    -- character has actually reached the cheese/altar target.
+    local function teleportNear(part, targetCFrame)
+        if not (part and part:IsA("BasePart") and part:IsDescendantOf(workspace)) then
+            return false
+        end
+
+        for attempt = 1, 3 do
+            hrp = getHRP()
+            if not hrp then
+                return false
+            end
+
+            local ok = pcall(function()
+                hrp.CFrame = targetCFrame
+            end)
+
+            if ok then
+                task.wait(0.22)
+                hrp = getHRP()
+                if hrp and (hrp.Position - targetCFrame.Position).Magnitude <= 8 then
+                    return true
+                end
+            end
+
+            task.wait(0.12)
+        end
+
+        return false
+    end
+
+    local function touchPart(part)
+        hrp = getHRP()
+        if not (hrp and part and part:IsA("BasePart") and part:IsDescendantOf(workspace)) then
+            return false
+        end
+
+        if not firetouchinterest then
+            return false
+        end
+
+        local ok = pcall(function()
+            firetouchinterest(hrp, part, 0)
+            game:GetService("VirtualInputManager"):SendKeyEvent(true, Enum.KeyCode.W, false, game)
+            task.wait(0.03)
+            game:GetService("VirtualInputManager"):SendKeyEvent(false, Enum.KeyCode.W, false, game)
+            game:GetService("VirtualInputManager"):SendKeyEvent(true, Enum.KeyCode.S, false, game)
+            task.wait(0.03)
+            game:GetService("VirtualInputManager"):SendKeyEvent(false, Enum.KeyCode.S, false, game)
+            firetouchinterest(hrp, part, 1)
+        end)
+        return ok
+    end
+
+    local function touchCheese(part)
+        -- The PuzzleBin cheese itself can have its own touch transmitter.
+        return touchPart(part)
+    end
+
+    local function touchMapAltar()
+        -- The altar's live touch target is separate from PuzzleBin's cheese
+        -- pickup. In the current map hierarchy it is usually:
+        -- Map.CheeseAltar.Base.Detect.TouchInterest.
+        local map = workspace:FindFirstChild("Map")
+        local mapAltar = map and map:FindFirstChild("CheeseAltar")
+        local base = mapAltar and mapAltar:FindFirstChild("Base")
+        local detect = base and base:FindFirstChild("Detect")
+        if not detect then
+            return false
+        end
+
+        -- TouchInterest/TouchTransmitter is an internal child of the part,
+        -- not something FireServer can be called on. Simulate touch against
+        -- the BasePart that owns it, with a descendant-part fallback.
+        local touchPartTarget = nil
+        if detect:IsA("BasePart") then
+            touchPartTarget = detect
+        else
+            local transmitter = detect:FindFirstChild("TouchInterest", true)
+            if transmitter and transmitter.Parent and transmitter.Parent:IsA("BasePart") then
+                touchPartTarget = transmitter.Parent
+            else
+                touchPartTarget = detect:FindFirstChildWhichIsA("BasePart", true)
+            end
+        end
+
+        if not touchPartTarget then
+            return false
+        end
+
+        return touchPart(touchPartTarget)
+    end
+
+    while running and isSurvivor() and (not retryDuringAutoFarm or Options.AutoPuzzles) do
+
+        local done, total = getPuzzleProgress()
+        local uiDone, uiTotal = getDisplayedPuzzleProgress()
+        local altarProgressed = (done and snapshot.Done and done > snapshot.Done)
+            or (uiDone and snapshot.UIDone and uiDone > snapshot.UIDone)
+
+        if altarProgressed or allRoundPuzzlesComplete() or altarNoLongerAvailable() then
+            return true
+        end
+
+        -- Stage 1: visit the cheese itself. Items.Part is the cheese target;
+        -- the earlier helper used this stop before moving to RootPart.
+        bin = workspace:FindFirstChild("PuzzleBin")
+        altarFolder = bin and bin:FindFirstChild("CheeseAltar")
+        items = altarFolder and altarFolder:FindFirstChild("Items")
+        cheesePart = items and items:FindFirstChild("Part")
+        rootPart = altarFolder and altarFolder:FindFirstChild("RootPart")
+        hrp = getHRP()
+
+        if not (hrp and cheesePart and cheesePart:IsA("BasePart")
+            and rootPart and rootPart:IsA("BasePart")) then
+            task.wait(0.25)
+            continue
+        end
+
+        local cheeseCFrame = cheesePart.CFrame * CFrame.new(0, 3, 0)
+        if not teleportNear(cheesePart, cheeseCFrame) then
+            task.wait(0.25)
+            continue
+        end
+
+        -- Trigger the cheese touch while standing at the cheese, before moving
+        -- away to the altar. This was missing from the newer direct-to-altar flow.
+        touchCheese(cheesePart)
+        task.wait(0.35)
+
+        -- Stage 2: move to the front of the altar, facing its RootPart.
+        local front = rootPart.Position + rootPart.CFrame.LookVector * 3 + Vector3.new(0, 1, 0)
+        local altarCFrame = CFrame.new(front, rootPart.Position)
+        if not teleportNear(rootPart, altarCFrame) then
+            task.wait(0.25)
+            continue
+        end
+
+        -- Trigger the map altar's own touch detector after arriving at the
+        -- altar. Then also touch the PuzzleBin cheese part as a compatibility
+        -- fallback for variants that attach their transmitter there instead.
+        local altarTouched = touchMapAltar()
+        local cheeseTouched = touchCheese(cheesePart)
+        if not altarTouched and not cheeseTouched then
+            warn("[GHAVE][Cheese] No altar/cheese TouchInterest target was available")
+        end
+
+        local detector = cheesePart:FindFirstChildOfClass("ClickDetector")
+            or cheesePart:FindFirstChildWhichIsA("ClickDetector", true)
+        if detector and fireclickdetector then
+            pcall(fireclickdetector, detector)
+        end
+
+        local prompt = cheesePart:FindFirstChildOfClass("ProximityPrompt")
+            or cheesePart:FindFirstChildWhichIsA("ProximityPrompt", true)
+        if prompt and prompt.Enabled then
+            if fireproximityprompt then
+                pcall(fireproximityprompt, prompt)
+            else
+                pcall(function()
+                    prompt:InputHoldBegin()
+                    task.wait(math.clamp(prompt.HoldDuration, 0.05, 0.4))
+                    prompt:InputHoldEnd()
+                end)
+            end
+        end
+
+        task.wait(0.45)
+
+        -- Both the manual action and AutoFarm keep repeating the complete
+        -- cheese -> altar interaction until puzzle progress confirms completion.
+        -- ClickDetector/Prompt removal alone is deliberately not accepted here.
+
+    end
+
+    return false
+
+end
+
+section(Puzzles, "Manual Puzzle Actions", 2)
+
+addButton(Puzzles, "Complete Pink Squash Puzzle", function()
+
+    runPuzzle("Pink Squash", solvePinkSquash)
+
+end)
+
+addButton(Puzzles, "Complete Painting Puzzle", function()
+
+    runPuzzle("Painting", solvePainting)
+
+end)
+
+addButton(Puzzles, "Complete Smoke Puzzle", function()
+
+    runPuzzle("Smoke", solveSmoke)
+
+end)
+
+addButton(Puzzles, "Complete Cheese Altar (One Attempt)", function()
+
+    runPuzzle("Cheese Altar", function()
+        return solveCheeseAltar(false)
+    end)
+
+end)
+
+addButton(Puzzles, "Collect VHS", function()
+
+    -- Restored original VHS pickup: Map.Memory.Item.Detect.
+    local ok = touchMemoryVHS(false)
+    if ok then
+        notify("Memory", "Touched the VHS pickup detector")
+    else
+        notify("Memory", "VHS pickup not found or firetouchinterest unavailable")
+    end
+
+end)
+
+addButton(Puzzles, "Teleport to Memory TV", function()
+
+    -- Memory.Base.Detect belongs to the TV interaction, not the VHS pickup.
+    -- This helper teleports to that detector and repeatedly activates it to
+    -- open/re-open the Memory screen.
+    local ok, count = touchMemoryMapDetect(MEMORY_TOUCH_REPEAT_COUNT)
+    if ok then
+        notify("Memory", "Teleported to the Memory TV and triggered it " .. tostring(count) .. " times")
+    else
+        notify("Memory", "Memory TV detector not found or firetouchinterest unavailable")
+    end
+
+end)
+
+
+-- Initialize only after every page, section, and button has been registered.
+pcall(function()
+    Window:Init()
+end)
+
+-- Apply the selected config on startup. Config flags are registered before
+-- this point, and background workers are started only by the later dispatcher.
+if autoLoadSettings.Enabled then
+    local configPath = getConfigFilePath(autoLoadSettings.Config)
+    local exists = false
+    if configPath and type(isfile) == "function" then
+        local ok, result = pcall(isfile, configPath)
+        exists = ok and result == true
+    end
+
+    if exists and type(readfile) == "function" then
+        local okRead, contents = pcall(readfile, configPath)
+        if okRead and type(contents) == "string" then
+            local okLoad, loaded, loadError = pcall(function()
+                return Library:LoadConfig(contents)
+            end)
+            if okLoad and loaded ~= false then
+                notify("Config", "Loaded " .. tostring(autoLoadSettings.Config))
+            else
+                warn("[GHAVE][Config] Autoload failed: " .. tostring(loadError or loaded))
+                autoLoadSettings.Enabled = false
+                suppressAutoLoadPersistence = true
+                pcall(function()
+                    autoLoadToggle:Set(false)
+                end)
+                suppressAutoLoadPersistence = false
+                saveAutoLoadSettings()
+            end
+        else
+            warn("[GHAVE][Config] Could not read the selected autoload config")
+        end
+    else
+        autoLoadSettings.Enabled = false
+        suppressAutoLoadPersistence = true
+        pcall(function()
+            autoLoadToggle:Set(false)
+        end)
+        suppressAutoLoadPersistence = false
+        saveAutoLoadSettings()
+        notify("Config", "Selected autoload config was not found")
+    end
+end
+
+if not Threads.ServerHopMonitor then
+    Threads.ServerHopMonitor = task.spawn(serverHopMonitorLoop)
+end
+
+if Library.Notification then
+    pcall(function()
+        Library:Notification({
+            Title = "GHAVE BEAR Alpha",
+            Description = mobileDetected
+                and "Touch controls detected — drag the floating button to move and open the menu."
+                or "Loaded — press LeftAlt to show or hide the menu.",
+            Duration = 5
+        })
+    end)
+end
+
+-- GET SPECTATE BUTTON EARLY
+-- Exact decompiler paths:
+--   ReplicatedFirst.GuiCollect -> .GameUI.RightHandButtons.SpectateToggle
+--   InGameDisplay controller -> .CanSpectate (BoolValue stored on the controller)
+-- The game hides RightHandButtons for Survivors and TeamChanged explicitly hides
+-- SpectateToggle. Moving the real button out of that container keeps its native
+-- MouseButton1Click connection; a visibility listener counters the native hide.
+local spectateButtonState = nil
+local guiCollectCache = nil
+local inGameDisplayControllerCache = nil
+
+local function restoreEarlySpectateButton()
+    if not spectateButtonState then
+        return
+    end
+
+    local state = spectateButtonState
+    if state.VisibleConnection then
+        pcall(function()
+            state.VisibleConnection:Disconnect()
+        end)
+    end
+    pcall(function()
+        if state.Button then
+            state.Button.Parent = state.Parent
+            state.Button.Position = state.Position
+            state.Button.Size = state.Size
+            state.Button.AnchorPoint = state.AnchorPoint
+            state.Button.ZIndex = state.ZIndex
+            state.Button.Visible = state.Visible
+            state.Button.Active = state.Active
+        end
+    end)
+    spectateButtonState = nil
+end
+
+local function getNativeSpectateReferences()
+    if not guiCollectCache then
+        local guiCollectModule = ReplicatedFirst:FindFirstChild("GuiCollect")
+        if guiCollectModule and guiCollectModule:IsA("ModuleScript") then
+            local ok, result = pcall(require, guiCollectModule)
+            if ok and type(result) == "table" then
+                guiCollectCache = result
+            end
+        end
+    end
+
+    if not inGameDisplayControllerCache then
+        local client = ReplicatedStorage:FindFirstChild("Client")
+        local gui = client and client:FindFirstChild("Gui")
+        local controllers = gui and gui:FindFirstChild("Controllers")
+        local module = controllers and controllers:FindFirstChild("InGameDisplay")
+        if module and module:IsA("ModuleScript") then
+            local ok, result = pcall(require, module)
+            if ok and type(result) == "table" then
+                inGameDisplayControllerCache = result
+            end
+        end
+    end
+
+    local gameUI = guiCollectCache and guiCollectCache.GameUI
+    if not gameUI then
+        return nil, nil, nil, nil
+    end
+
+    local rightHandButtons = gameUI:FindFirstChild("RightHandButtons")
+    local button = spectateButtonState and spectateButtonState.Button
+        or (rightHandButtons and rightHandButtons:FindFirstChild("SpectateToggle"))
+    local spectateUI = gameUI:FindFirstChild("SpectateUI")
+    local canSpectate = inGameDisplayControllerCache and inGameDisplayControllerCache.CanSpectate
+
+    return gameUI, canSpectate, button, spectateUI
+end
+
+local function updateEarlySpectateButton()
+    if not Options.GetSpectateButtonEarly or not isSurvivor() then
+        restoreEarlySpectateButton()
+        return
+    end
+
+    local gameUI, canSpectate, button = getNativeSpectateReferences()
+    if not (gameUI and canSpectate and canSpectate.Value == true
+        and button and button:IsA("GuiButton")) then
+        return
+    end
+
+    if not spectateButtonState then
+        spectateButtonState = {
+            Button = button,
+            Parent = button.Parent,
+            Position = button.Position,
+            Size = button.Size,
+            AnchorPoint = button.AnchorPoint,
+            ZIndex = button.ZIndex,
+            Visible = button.Visible,
+            Active = button.Active,
+            CanSpectate = canSpectate
+        }
+
+        local state = spectateButtonState
+        state.VisibleConnection = button:GetPropertyChangedSignal("Visible"):Connect(function()
+            if spectateButtonState == state
+                and Options.GetSpectateButtonEarly
+                and isSurvivor()
+                and canSpectate.Value == true
+                and not button.Visible then
+                button.Visible = true
+            end
+        end)
+    end
+
+    -- The native TeamChanged handler sets RightHandButtons.Visible=false and
+    -- SpectateToggle.Visible=false for Survivors. Keep the original button
+    -- outside that hidden container instead of cloning a button with no handler.
+    if button.Parent ~= gameUI then
+        button.Parent = gameUI
+    end
+    button.AnchorPoint = Vector2.new(1, 0.5)
+    button.Position = UDim2.new(1, -20, 0.72, 0)
+    button.Size = UDim2.fromOffset(56, 56)
+    button.ZIndex = 10
+    button.Active = true
+    button.Visible = true
+end
+
+local function quidzLoop()
+
+    while running and Options.Quidz do
+
+        if not isWaiting() then
+
+            Options.Quidz = false
+
+            if QuidzToggle then
+
+                QuidzToggle:Set(false)
+
+            end
+
+            notify("Quidz", "Not on Waiting team")
+
+            break
+
+        end
+
+        local hrp = getHRP()
+
+        if hrp then
+
+            local platform, targetPosition = ensureQuidzPlatform()
+            local part = getQuidzTarget()
+
+            -- RootPart is positioned safely above the platform top.
+            hrp.CFrame = CFrame.new(targetPosition.X, targetPosition.Y, targetPosition.Z)
+
+            if part and firetouchinterest then
+
+                firetouchinterest(hrp, part, 1)
+
+                task.wait()
+
+                firetouchinterest(hrp, part, 0)
+
+            end
+
+        end
+
+        task.wait(0.05)
+
+    end
+
+    Threads.Quidz = nil
+
+end
+
+local function isWireModel(m)
+
+    if not m then
+
+        return false
+
+    end
+
+    local isWireType = m:GetAttribute("Type") == "Wire"
+    local wireNamed = m.Name:lower():find("wire", 1, true) ~= nil
+
+    return (isWireType or wireNamed) and m:FindFirstChild("Wires") ~= nil
+
+end
+
+local function getWireModels()
+
+    -- Same discovery rule as the uploaded main script. The two wire puzzles
+    -- are separate map models, each containing a child named "Wires".
+    local map = workspace:FindFirstChild("Map")
+
+    local list = {}
+
+    if not map then
+
+        return list
+
+    end
+
+    for _, m in ipairs(map:GetChildren()) do
+
+        if isWireModel(m) then
+
+            table.insert(list, m)
+
+        end
+
+    end
+
+    table.sort(list, function(a, b)
+
+        return a.Name < b.Name
+
+    end)
+
+    return list
+
+end
+
+local function getDetectors(model)
+
+    local list = {}
+
+    local folder = model and model:FindFirstChild("Wires")
+
+    if not folder then
+
+        return list
+
+    end
+
+    for _, p in ipairs(folder:GetDescendants()) do
+
+        if p:IsA("BasePart") then
+
+            local cd = p:FindFirstChildOfClass("ClickDetector")
+
+            if cd then
+
+                table.insert(list, { Part = p, CD = cd })
+
+            end
+
+        end
+
+    end
+
+    return list
+
+end
+
+local function wiresLoop()
+
+    local processedDetectors = setmetatable({}, { __mode = "k" })
+    local lastWasClosest = false
+    local cleanupMovement = beginNoGravityNoCollision(true)
+
+    while running and Options.Wires do
+
+        local hrp = getHRP()
+
+        local nextModel = nil
+        local nextDetectors = nil
+
+        if hrp then
+
+            for _, model in ipairs(getWireModels()) do
+
+                local pending = {}
+
+                for _, detector in ipairs(getDetectors(model)) do
+
+                    if not processedDetectors[detector.CD] then
+
+                        table.insert(pending, detector)
+
+                    end
+
+                end
+
+                if #pending > 0 then
+
+                    nextModel = model
+                    nextDetectors = pending
+                    break
+
+                end
+
+            end
+
+        end
+
+        if not nextModel or not nextDetectors then
+
+            -- Keep checking for a second puzzle that may load later.
+            task.wait(1)
+
+            continue
+
+        end
+
+        notify("Wires", "Working on " .. nextModel.Name)
+
+        -- Process one wire model per activation cycle. After completing it,
+        -- leave the toggle active and rescan in 10 seconds for puzzle two.
+        while running and Options.Wires and #nextDetectors > 0 do
+
+            hrp = getHRP()
+
+            if not hrp then
+
+                task.wait(0.25)
+
+                continue
+
+            end
+
+            local closestIndex, farthestIndex
+            local minD, maxD = math.huge, -1
+
+            for i, detector in ipairs(nextDetectors) do
+
+                if detector.Part and detector.Part.Parent and detector.CD and detector.CD.Parent then
+
+                    local dist = (hrp.Position - detector.Part.Position).Magnitude
+
+                    if dist < minD then
+
+                        minD, closestIndex = dist, i
+
+                    end
+
+                    if dist > maxD then
+
+                        maxD, farthestIndex = dist, i
+
+                    end
+
+                end
+
+            end
+
+            local pickIndex = lastWasClosest and farthestIndex or closestIndex
+
+            if not pickIndex then
+
+                break
+
+            end
+
+            local target = table.remove(nextDetectors, pickIndex)
+            lastWasClosest = not lastWasClosest
+
+            if target and target.Part and target.Part.Parent and target.CD and target.CD.Parent then
+
+                -- Stay locally hidden and noclip 5 studs behind and 15 studs
+                -- below each wire, never directly on top of the detector.
+                -- The wire-session helper continuously cancels gravity.
+                local behindPosition = target.Part.Position
+                    - target.Part.CFrame.LookVector * 5
+                    - Vector3.new(0, 15, 0)
+                hrp.CFrame = CFrame.lookAt(behindPosition, target.Part.Position)
+
+                task.wait(0.12)
+
+                if fireclickdetector then
+
+                    local ok, err = pcall(fireclickdetector, target.CD)
+
+                    if ok then
+
+                        processedDetectors[target.CD] = true
+
+                    else
+
+                        warn("[GHAVE][Wires] Click failed: " .. tostring(err))
+
+                    end
+
+                else
+
+                    warn("[GHAVE][Wires] fireclickdetector is unavailable")
+
+                    break
+
+                end
+
+            end
+
+            task.wait(0.3)
+
+        end
+
+        -- This pause is intentional: on maps with two wire puzzles, the
+        -- second module can finish loading during this interval.
+        for _ = 1, 10 do
+
+            if not running or not Options.Wires then
+
+                break
+
+            end
+
+            task.wait(1)
+
+        end
+
+    end
+
+    if cleanupMovement then
+        pcall(cleanupMovement)
+    end
+    Threads.Wires = nil
+
+end
+
+local function nearestLoop()
+
+    while running and Options.Nearest do
+
+        local hrp = getHRP()
+
+        if hrp and fireclickdetector then
+
+            for _, m in getWireModels() do
+
+                for _, d in getDetectors(m) do
+
+                    if (hrp.Position - d.Part.Position).Magnitude <= Options.NearestRange then
+
+                        fireclickdetector(d.CD)
+
+                    end
+
+                end
+
+            end
+
+        end
+
+        task.wait(0.05)
+
+    end
+
+    Threads.Nearest = nil
+
+end
+
+
+local function colorCodeLoop()
+
+    while running and Options.ColorCode do
+
+        pcall(function()
+
+            local map = workspace:FindFirstChild("Map")
+
+            local folder = map and map:FindFirstChild("ColorCode")
+
+            if not folder then
+
+                task.wait(1.5)
+
+                return
+
+            end
+
+            local base = folder:FindFirstChild("Base")
+
+            local codePos = folder:FindFirstChild("CodePositions")
+
+            if not (base and codePos) then
+
+                task.wait(1)
+
+                return
+
+            end
+
+            local note = codePos:FindFirstChild("Clue")
+
+                and codePos.Clue:FindFirstChild("Note")
+
+                and codePos.Clue.Note:FindFirstChild("Frame")
+
+            if not note then
+
+                task.wait(1)
+
+                return
+
+            end
+
+            local clues = {}
+
+            local have = 0
+
+            for i = 1, 4 do
+
+                local f = note:FindFirstChild(tostring(i))
+
+                if f and f:IsA("TextLabel") and f.Text ~= "" then
+
+                    clues[i] = f.Text
+
+                    have += 1
+
+                end
+
+            end
+
+            if have < 4 then
+
+                task.wait(1)
+
+                return
+
+            end
+
+            local buttons = base:FindFirstChild("Buttons")
+
+            if not buttons then
+
+                task.wait(1)
+
+                return
+
+            end
+
+            for pos = 1, 4 do
+
+                if not Options.ColorCode then
+
+                    break
+
+                end
+
+                local btn = buttons:FindFirstChild(tostring(pos))
+
+                if not btn then
+
+                    break
+
+                end
+
+                local cd = btn:FindFirstChildOfClass("ClickDetector")
+
+                local lbl = btn:FindFirstChild("Note") and btn.Note:FindFirstChild("Label")
+
+                if not (cd and lbl) then
+
+                    break
+
+                end
+
+                local target = clues[pos]
+
+                local safety = 0
+
+                while lbl.Text ~= target and Options.ColorCode and safety < 24 do
+
+                    if fireclickdetector then
+
+                        fireclickdetector(cd)
+
+                    end
+
+                    task.wait(0.1)
+
+                    if not btn.Parent then
+
+                        break
+
+                    end
+
+                    safety += 1
+
+                end
+
+            end
+
+        end)
+
+        task.wait(1)
+
+    end
+
+    Threads.ColorCode = nil
+
+end
+
+-- ---------- SEQUENTIAL SURVIVOR AUTO PUZZLES ----------
+local function setPuzzleOption(key, value)
+
+    value = value == true
+    local previous = Options[key]
+    Options[key] = value
+
+    local toggle = toggles[key]
+    if toggle and previous ~= value then
+        local ok, err = pcall(function()
+            assert(type(toggle.Set) == "function", "Toggle:Set is unavailable")
+            toggle:Set(value)
+        end)
+        if not ok then
+            warn("[GHAVE][AutoPuzzles] Could not sync " .. tostring(key) .. " toggle: " .. tostring(err))
+        end
+    end
+
+end
+
+local function getPuzzleBin()
+    return workspace:FindFirstChild("PuzzleBin")
+end
+
+local function findNamedChildren(parent, wantedName)
+
+    local found = {}
+    if not parent then
+        return found
+    end
+
+    local wanted = string.lower(wantedName)
+    for _, child in ipairs(parent:GetChildren()) do
+        if string.lower(child.Name) == wanted then
+            table.insert(found, child)
+        end
+    end
+
+    return found
+
+end
+
+local function getSmokeRoot()
+
+    local bin = getPuzzleBin()
+    local map = workspace:FindFirstChild("Map")
+    local mapRoot = map and map:FindFirstChild("Smoke")
+    local binRoot = bin and bin:FindFirstChild("Smoke")
+
+    local function hasEnabledPrompt(root)
+        if not root then
+            return false
+        end
+        for _, descendant in ipairs(root:GetDescendants()) do
+            if descendant:IsA("ProximityPrompt") and descendant.Parent and descendant.Enabled then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function hasActiveClickDetector(root)
+        if not root then
+            return false
+        end
+        for _, descendant in ipairs(root:GetDescendants()) do
+            if descendant:IsA("ClickDetector") and descendant.Parent
+                and descendant.MaxActivationDistance > 0 then
+                return true
+            end
+        end
+        return false
+    end
+
+    -- Prefer the tree with active prompts; Map and PuzzleBin may stream apart.
+    if hasEnabledPrompt(mapRoot) then
+        return mapRoot
+    elseif hasEnabledPrompt(binRoot) then
+        return binRoot
+    elseif hasActiveClickDetector(mapRoot) then
+        return mapRoot
+    elseif hasActiveClickDetector(binRoot) then
+        return binRoot
+    end
+
+    return mapRoot or binRoot
+
+end
+
+local function smokeHasAvailableInteractables()
+
+    local bin = getPuzzleBin()
+    local map = workspace:FindFirstChild("Map")
+    local roots = {
+        map and map:FindFirstChild("Smoke"),
+        bin and bin:FindFirstChild("Smoke"),
+    }
+
+    local promptsExist = false
+    for _, root in ipairs(roots) do
+        if root then
+            for _, descendant in ipairs(root:GetDescendants()) do
+                if descendant:IsA("ProximityPrompt") then
+                    promptsExist = true
+                    if descendant.Parent and descendant.Enabled then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+
+    -- If this map's Smoke objects use prompts, disabled prompts mean the
+    -- prompt sequence is finished. Ignore unrelated/stale click detectors.
+    if promptsExist then
+        return false
+    end
+
+    for _, root in ipairs(roots) do
+        if root then
+            for _, descendant in ipairs(root:GetDescendants()) do
+                if descendant:IsA("ClickDetector") and descendant.Parent
+                    and descendant.MaxActivationDistance > 0 then
+                    return true
+                end
+            end
+        end
+    end
+
+    return false
+
+end
+
+local PUZZLE_QUEUE_ORDER = {
+    "Wire",
+    "CheeseAltar",
+    "ColorCode",
+    "Memory",
+    "Smoke",
+    "PinkSquash",
+    "Painting",
+}
+
+local function isPuzzleAvailable(kind)
+
+    local bin = getPuzzleBin()
+    local map = workspace:FindFirstChild("Map")
+    if not bin then
+        return false
+    end
+
+    local marker = bin:FindFirstChild(kind)
+
+    if kind == "Wire" then
+        -- Some maps use two separate Wire markers; all are solved in one stage.
+        local markers = findNamedChildren(bin, "Wire")
+        local hasMapWire = map and #getWireModels() > 0
+        return #markers > 0 or hasMapWire == true
+    elseif kind == "CheeseAltar" then
+        local altar = bin:FindFirstChild("CheeseAltar")
+        local items = altar and altar:FindFirstChild("Items")
+        local cheese = items and items:FindFirstChild("Part")
+        return altar ~= nil or (cheese ~= nil and cheese:IsA("BasePart"))
+    elseif kind == "ColorCode" then
+        return marker ~= nil or (map and map:FindFirstChild("ColorCode") ~= nil)
+    elseif kind == "Memory" then
+        local memoryMap = map and map:FindFirstChild("Memory")
+        local base = memoryMap and memoryMap:FindFirstChild("Base")
+        local mapDetect = base and base:FindFirstChild("Detect")
+        local item = memoryMap and memoryMap:FindFirstChild("Item")
+        local legacyDetect = item and item:FindFirstChild("Detect")
+        return marker ~= nil or mapDetect ~= nil or legacyDetect ~= nil
+    elseif kind == "Smoke" then
+        local mapSmoke = map and map:FindFirstChild("Smoke")
+        local binSmoke = bin:FindFirstChild("Smoke")
+        return marker ~= nil or mapSmoke ~= nil or binSmoke ~= nil
+    elseif kind == "PinkSquash" then
+        return marker ~= nil or #collectPinkSquashTargets() > 0
+    elseif kind == "Painting" then
+        local painting = map and map:FindFirstChild("Painting")
+        local models = painting and painting:FindFirstChild("Models")
+        return marker ~= nil or (models ~= nil and #models:GetChildren() > 0)
+    end
+
+    return marker ~= nil
+
+end
+
+local function isGreenPart(part)
+
+    if not (part and part:IsA("BasePart")) then
+        return false
+    end
+
+    local color = part.Color
+    if color.G >= 0.35 and color.G > color.R * 1.12 and color.G > color.B * 1.08 then
+        return true
+    end
+
+    local brickName = string.lower(part.BrickColor.Name)
+    return string.find(brickName, "green", 1, true) ~= nil
+
+end
+
+local function wireFolderPartsGreen(folder)
+
+    if not folder then
+        return false
+    end
+
+    local foundPart = false
+    for _, descendant in ipairs(folder:GetDescendants()) do
+        if descendant:IsA("BasePart") then
+            foundPart = true
+            if not isGreenPart(descendant) then
+                return false
+            end
+        end
+    end
+
+    return foundPart
+
+end
+
+local function wirePuzzleComplete(stageStartedAt)
+
+    local bin = getPuzzleBin()
+    local markers = findNamedChildren(bin, "Wire")
+    local models = getWireModels()
+
+    if #markers == 0 then
+        return true
+    end
+    if #models < #markers then
+        return false
+    end
+
+    for _, model in ipairs(models) do
+        local folder = model:FindFirstChild("Wires")
+        if not folder then
+            return false
+        end
+
+        local detectors = getDetectors(model)
+        if #detectors == 0 then
+            -- A wire model with no active detector is only complete when its
+            -- wire geometry has turned green, not merely because it streamed in.
+            if not wireFolderPartsGreen(folder) then
+                return false
+            end
+        else
+            for _, record in ipairs(detectors) do
+                local detector = record.CD
+                local inactive = not detector.Parent or detector.MaxActivationDistance <= 0
+                local green = isGreenPart(record.Part)
+                if not inactive and not green then
+                    return false
+                end
+            end
+        end
+    end
+
+    return true
+
+end
+
+local function allWireDetectorsUnavailable()
+
+    local models = getWireModels()
+    if #models == 0 then
+        return false
+    end
+
+    for _, model in ipairs(models) do
+        local folder = model:FindFirstChild("Wires")
+        if not folder then
+            return false
+        end
+
+        local detectors = getDetectors(model)
+        if #detectors == 0 then
+            if not wireFolderPartsGreen(folder) then
+                return false
+            end
+        else
+            for _, record in ipairs(detectors) do
+                local detector = record.CD
+                if detector.Parent and detector.MaxActivationDistance > 0 then
+                    return false
+                end
+            end
+        end
+    end
+
+    return true
+
+end
+
+local function smokePuzzleComplete()
+
+    return not smokeHasAvailableInteractables()
+
+end
+
+local function colorCodePuzzleSolved(snapshot)
+
+    local map = workspace:FindFirstChild("Map")
+    local folder = map and map:FindFirstChild("ColorCode")
+    local base = folder and folder:FindFirstChild("Base")
+    local codePos = folder and folder:FindFirstChild("CodePositions")
+    local note = codePos and codePos:FindFirstChild("Clue")
+        and codePos.Clue:FindFirstChild("Note")
+        and codePos.Clue.Note:FindFirstChild("Frame")
+    local buttons = base and base:FindFirstChild("Buttons")
+
+    if not (note and buttons) then
+        return false
+    end
+
+    local allMatched = true
+    local noActiveDetectors = true
+
+    for pos = 1, 4 do
+        local clue = note:FindFirstChild(tostring(pos))
+        local button = buttons:FindFirstChild(tostring(pos))
+        local label = button and button:FindFirstChild("Note") and button.Note:FindFirstChild("Label")
+        local detector = button and button:FindFirstChildOfClass("ClickDetector")
+
+        if detector and detector.Parent and detector.MaxActivationDistance > 0 then
+            noActiveDetectors = false
+        end
+
+        if not (clue and label and clue:IsA("TextLabel") and label:IsA("TextLabel")
+            and clue.Text ~= "" and label.Text == clue.Text) then
+            allMatched = false
+        end
+    end
+
+    if not allMatched then
+        return false
+    end
+
+    return noActiveDetectors or (snapshot ~= nil and puzzleSnapshotAdvanced(snapshot))
+
+end
+
+local function waitForStage(stageName, snapshot, completionPredicate, timeout)
+
+    local deadline = os.clock() + (timeout or 60)
+
+    while running and Options.AutoPuzzles and isSurvivor() and os.clock() < deadline do
+        if puzzleSnapshotAdvanced(snapshot) then
+            if not completionPredicate or completionPredicate() then
+                return true
+            end
+        end
+
+        if completionPredicate and completionPredicate() then
+            return true
+        end
+
+        if allRoundPuzzlesComplete() then
+            return true
+        end
+
+        task.wait(0.15)
+    end
+
+    if not running or not Options.AutoPuzzles or not isSurvivor() then
+        return false
+    end
+
+    warn("[GHAVE][AutoPuzzles] Timed out waiting for " .. stageName .. " completion")
+    return false
+
+end
+
+local function runWireStage()
+
+    local snapshot = capturePuzzleSnapshot()
+    notify("AutoPuzzles", "Wire puzzle — enabling both wire helpers")
+
+    setPuzzleOption("Wires", true)
+    setPuzzleOption("Nearest", true)
+
+    local stageStartedAt = os.clock()
+    local complete = waitForStage("Wire", snapshot, function()
+        local visuallyComplete = wirePuzzleComplete(stageStartedAt)
+        local progressConfirmed = puzzleSnapshotAdvanced(snapshot)
+        local allUnavailable = allWireDetectorsUnavailable()
+        return visuallyComplete and (progressConfirmed or allUnavailable)
+    end, 90)
+
+    setPuzzleOption("Wires", false)
+    setPuzzleOption("Nearest", false)
+
+    return complete
+
+end
+
+local function runCheeseStage()
+
+    notify("AutoPuzzles", "Cheese Altar — retrying until completed")
+
+    local solved = solveCheeseAltar(true)
+    if not solved then
+        return false
+    end
+
+    -- The inner solver only returns true after puzzle progress/Quidz changes,
+    -- the marker disappears, or the altar's ClickDetector/Prompt is disabled.
+    return solved
+
+end
+
+local function runSmokeStage()
+
+    local snapshot = capturePuzzleSnapshot()
+    notify("AutoPuzzles", "Smoke puzzle — processing each detector")
+
+    local solved = solveSmoke()
+    if not solved then
+        return false
+    end
+
+    return waitForStage("Smoke", snapshot, smokePuzzleComplete, 25)
+
+end
+
+local function runColorCodeStage()
+
+    local snapshot = capturePuzzleSnapshot()
+    local hrp = getHRP()
+    local bin = getPuzzleBin()
+    local colorBin = bin and bin:FindFirstChild("ColorCode")
+    local decor = colorBin and colorBin:FindFirstChild("Decor")
+    local question = decor and decor:FindFirstChild("Question")
+
+    if hrp and question and question:IsA("BasePart") then
+        hrp.CFrame = question.CFrame * CFrame.new(0, 5, 0)
+        task.wait(0.2)
+    end
+
+    notify("AutoPuzzles", "ColorCode — solving in order")
+    setPuzzleOption("ColorCode", true)
+
+    local complete = waitForStage("ColorCode", snapshot, function()
+        return colorCodePuzzleSolved(snapshot)
+    end, 60)
+
+    setPuzzleOption("ColorCode", false)
+    return complete
+
+end
+
+local function getMemoryPuzzleRemote()
+    local gui = player:FindFirstChild("PlayerGui")
+    if not gui then
+        return nil
+    end
+
+    for _, descendant in ipairs(gui:GetDescendants()) do
+        if descendant.Name == "Event" and descendant:IsA("ObjectValue") then
+            local remote = descendant.Value
+            if remote and remote:IsA("RemoteEvent")
+                and remote:GetAttribute("GhaveHooked") == true then
+                return remote
+            end
+        end
+    end
+    return nil
+end
+
+local function getMemoryScreenFacingTarget()
+    local bin = getPuzzleBin()
+    local marker = bin and bin:FindFirstChild("Memory")
+    local screenRoot = marker and marker:FindFirstChild("RootPart")
+    if screenRoot and screenRoot:IsA("BasePart") and screenRoot:IsDescendantOf(workspace) then
+        return screenRoot
+    end
+
+    return getMemoryMapTouchPart()
+end
+
+local function memoryPuzzleProgressAdvanced(snapshot)
+    local done = getPuzzleProgress()
+    local uiDone = getDisplayedPuzzleProgress()
+
+    if done and snapshot and snapshot.Done and done > snapshot.Done then
+        return true
+    end
+
+    if uiDone and snapshot and snapshot.UIDone and uiDone > snapshot.UIDone then
+        return true
+    end
+
+    return false
+end
+
+local function memoryPuzzleComplete(snapshot)
+    return memoryPuzzleProgressAdvanced(snapshot)
+        or allRoundPuzzlesComplete()
+        or not isPuzzleAvailable("Memory")
+end
+
+local function moveAtMemoryScreenUntilComplete(snapshot)
+    local cleanupMovement = beginNoGravityNoCollision()
+    local hrp = getHRP(5)
+    if not hrp then
+        cleanupMovement()
+        return false, false
+    end
+
+    local startPosition = hrp.Position
+    local startedAt = os.clock()
+    local promptReady = false
+    local phaseDuration = 5
+    local phaseIndex = 1
+    local phaseStartedAt = startedAt
+    local forwardBackDistance = 1.5
+    local completed = false
+
+    -- The Auto VHS remote hook can become ready before the quest is complete.
+    -- Keep the three 5-second movement phases running after the hook is ready,
+    -- and stop only when puzzle progress advances or the Memory marker clears.
+    -- Each phase keeps the character facing the screen:
+    -- 1) forward/back at the starting height,
+    -- 2) forward/back while descending 5 studs,
+    -- 3) forward/back while rising back to the starting height.
+    while running and Options.Memory and isSurvivor() do
+        if memoryPuzzleComplete(snapshot) then
+            completed = true
+            break
+        end
+
+        if getMemoryPuzzleRemote() then
+            promptReady = true
+        end
+
+        hrp = getHRP(2)
+        local target = getMemoryScreenFacingTarget()
+        if hrp and target and target:IsA("BasePart") then
+            local toward = target.Position - startPosition
+            toward = Vector3.new(toward.X, 0, toward.Z)
+            if toward.Magnitude < 0.1 then
+                local screenFront = -target.CFrame.LookVector
+                toward = Vector3.new(screenFront.X, 0, screenFront.Z)
+            end
+            if toward.Magnitude < 0.1 then
+                toward = Vector3.new(0, 0, -1)
+            end
+            toward = toward.Unit
+
+            local now = os.clock()
+            local phaseElapsed = now - phaseStartedAt
+            if phaseElapsed >= phaseDuration then
+                phaseIndex = (phaseIndex % 3) + 1
+                phaseStartedAt = now
+                phaseElapsed = 0
+            end
+
+            local phaseProgress = math.clamp(phaseElapsed / phaseDuration, 0, 1)
+            local verticalOffset
+            if phaseIndex == 1 then
+                verticalOffset = 0
+            elseif phaseIndex == 2 then
+                verticalOffset = -5 * phaseProgress
+            else
+                verticalOffset = -5 * (1 - phaseProgress)
+            end
+
+            local forwardBackOffset = math.sin((phaseElapsed / 2.5) * math.pi * 2)
+                * forwardBackDistance
+            local position = startPosition
+                + toward * forwardBackOffset
+                + Vector3.new(0, verticalOffset, 0)
+            local facingPosition = Vector3.new(target.Position.X, position.Y, target.Position.Z)
+
+            pcall(function()
+                hrp.CFrame = CFrame.lookAt(position, facingPosition)
+            end)
+        end
+
+        task.wait(0.04)
+    end
+
+    if not completed then
+        completed = memoryPuzzleComplete(snapshot)
+    end
+
+    cleanupMovement()
+    return promptReady, completed
+end
+
+local function runMemoryStage()
+
+    local snapshot = capturePuzzleSnapshot()
+    notify("AutoPuzzles", "Memory / VHS — collecting the VHS, then teleporting to the TV and opening its screen")
+
+    -- Enable the existing PlayerGui Event hook before collecting/opening.
+    setPuzzleOption("Memory", true)
+
+    -- First collect the actual VHS pickup. The pickup is Item.Detect, not the
+    -- Base.Detect touch trigger used by the Memory TV/screen.
+    local collectedVHS = false
+    for attempt = 1, 3 do
+        if not running or not Options.Memory then
+            break
+        end
+
+        collectedVHS = touchMemoryVHS(true) or collectedVHS
+        task.wait(0.25)
+        if puzzleSnapshotAdvanced(snapshot) then
+            break
+        end
+    end
+
+    if collectedVHS then
+        notify("Memory", "Triggered the VHS pickup")
+    else
+        notify("Memory", "VHS pickup not found or touch could not be fired")
+    end
+
+    -- Touch the TV detector, then keep moving through the screen in short
+    -- forward/back strokes with noclip and zero gravity. The movement continues
+    -- after the Auto VHS hook is ready and ends when the quest itself completes.
+    local touched, pulseCount = touchMemoryMapDetect(MEMORY_TOUCH_REPEAT_COUNT)
+    local completedDuringMovement = false
+    if touched then
+        notify("Memory", "Triggered the TV screen " .. tostring(pulseCount) .. " times — moving until the VHS puzzle completes")
+        local promptReady
+        promptReady, completedDuringMovement = moveAtMemoryScreenUntilComplete(snapshot)
+        if promptReady then
+            notify("Memory", "VHS prompt detected — Auto VHS solver is active; movement continues until completion")
+        else
+            notify("Memory", "Waiting for the VHS prompt while continuing the screen movement")
+        end
+    else
+        notify("Memory", "Could not find or trigger the Memory TV detector")
+    end
+
+    local complete = completedDuringMovement or memoryPuzzleComplete(snapshot)
+    if not complete then
+        complete = waitForStage("Memory / VHS", snapshot, function()
+            return memoryPuzzleComplete(snapshot)
+        end, 10)
+    end
+
+    setPuzzleOption("Memory", false)
+    return complete
+
+end
+
+local function runPinkSquashStage()
+
+    notify("AutoPuzzles", "Pink Squash — teleporting and clicking each target until its ClickDetector is removed")
+
+    local hadTargets = false
+
+    while running and Options.AutoPuzzles and isSurvivor() do
+        local targets = collectPinkSquashTargets()
+        local target = targets[1]
+
+        if not target then
+            if hadTargets then
+                -- The last target's ClickDetector has disappeared. Unlike
+                -- Cheese Altar and VHS, this is Pink Squash's completion signal.
+                return true
+            end
+            task.wait(0.2)
+            continue
+        end
+
+        hadTargets = true
+        while running and Options.AutoPuzzles and isSurvivor()
+            and pinkSquashTargetActive(target) do
+            local hrp = getHRP()
+            if not hrp then
+                task.wait(0.2)
+                continue
+            end
+
+            local fired = activatePinkSquashTarget(target, hrp)
+            if not fired then
+                warn("[GHAVE][PinkSquash] Could not fire ClickDetector: "
+                    .. (target.Part and target.Part:GetFullName() or "unknown target"))
+                task.wait(0.4)
+            else
+                -- Never mark this piece complete just because fireclickdetector
+                -- returned successfully. Wait for the detector itself to be
+                -- removed, then advance to the next active detector.
+                local checkUntil = os.clock() + 0.5
+                repeat
+                    task.wait(0.05)
+                until not pinkSquashTargetActive(target)
+                    or not running or not Options.AutoPuzzles or not isSurvivor()
+                    or os.clock() >= checkUntil
+            end
+        end
+
+        task.wait(0.08)
+    end
+
+    return false
+
+end
+
+local function paintingPuzzleComplete()
+
+    local map = workspace:FindFirstChild("Map")
+    local painting = map and map:FindFirstChild("Painting")
+    local models = painting and painting:FindFirstChild("Models")
+    if not models then
+        return false
+    end
+
+    local found = false
+    for _, model in ipairs(models:GetChildren()) do
+        local part = model:FindFirstChild("Painting", true)
+        if part and part:IsA("BasePart") then
+            found = true
+            if not paintingIsSolved(model, part) then
+                return false
+            end
+        end
+    end
+
+    return found
+
+end
+
+local function runPaintingStage()
+    local snapshot = capturePuzzleSnapshot()
+    notify("AutoPuzzles", "Painting — rotating each picture until its target orientation")
+
+    for attempt = 1, 8 do
+        if not running or not Options.AutoPuzzles or not isSurvivor() then
+            return false
+        end
+
+        local ok, result = pcall(solvePainting)
+        if not ok then
+            warn("[GHAVE][AutoPuzzles] Painting attempt failed: " .. tostring(result))
+        end
+
+        if puzzleSnapshotAdvanced(snapshot) or allRoundPuzzlesComplete()
+            or paintingPuzzleComplete() or not isPuzzleAvailable("Painting") then
+            return true
+        end
+
+        if ok and result then
+            if waitForStage("Painting", snapshot, function()
+                return puzzleSnapshotAdvanced(snapshot) or paintingPuzzleComplete()
+                    or not isPuzzleAvailable("Painting")
+            end, 20) then
+                return true
+            end
+        end
+
+        task.wait(0.5)
+    end
+
+    return puzzleSnapshotAdvanced(snapshot) or paintingPuzzleComplete()
+        or not isPuzzleAvailable("Painting")
+end
+
+local function runAutoPuzzleStage(kind)
+
+    if kind == "Wire" then
+        return runWireStage()
+    elseif kind == "CheeseAltar" then
+        return runCheeseStage()
+    elseif kind == "ColorCode" then
+        return runColorCodeStage()
+    elseif kind == "Memory" then
+        return runMemoryStage()
+    elseif kind == "Smoke" then
+        return runSmokeStage()
+    elseif kind == "PinkSquash" then
+        return runPinkSquashStage()
+    elseif kind == "Painting" then
+        return runPaintingStage()
+    end
+
+    return false
+
+end
+
+local function buildPuzzleQueue()
+
+    local queue = {}
+    for _, kind in ipairs(PUZZLE_QUEUE_ORDER) do
+        if isPuzzleAvailable(kind) then
+            table.insert(queue, kind)
+        end
+    end
+    return queue
+
+end
+
+local function stopPuzzleWorkers()
+
+    for _, key in ipairs({ "Wires", "Nearest", "ColorCode", "Memory" }) do
+        local ok, err = pcall(setPuzzleOption, key, false)
+        if not ok then
+            Options[key] = false
+            warn("[GHAVE][AutoPuzzles] Worker cleanup failed for " .. key .. ": " .. tostring(err))
+        end
+    end
+
+end
+
+-- FLING BEAR AFTER THE SURVIVOR PUZZLE QUEUE
+-- Uses the user's supplied lobby part and pad location. The active Bear is
+-- resolved from the game's team assignment, so no hard-coded username is needed.
+local FLING_REQUIRED_CFRAME = CFrame.new(251, 53, -27)
+local FLING_UPDATE_INTERVAL = 0.05
+local FLING_MOVEMENT_SPEED = 150
+local FLING_BURST_DURATION = 2.5
+local FLING_BURST_PAUSE = 0.15
+local FLING_PAD_RECHECK_INTERVAL = 0.6
+
+local function isBearPlayer(targetPlayer)
+    if not targetPlayer or targetPlayer == player then
+        return false
+    end
+
+    local teamName = targetPlayer.Team and targetPlayer.Team.Name or ""
+    return targetPlayer.TeamColor == BEAR_TEAM_COLOR
+        or teamName == "Bear"
+        or teamName == "BEAR"
+end
+
+local function findNextActiveBearPlayer(alreadyHandled)
+    -- Return one Bear at a time. If a round has multiple Bear-role players,
+    -- the fling worker finishes with the current one before selecting another.
+    local candidates = {}
+    for _, candidate in ipairs(Players:GetPlayers()) do
+        if isBearPlayer(candidate) and not alreadyHandled[candidate] then
+            table.insert(candidates, candidate)
+        end
+    end
+    table.sort(candidates, function(a, b)
+        return a.UserId < b.UserId
+    end)
+    return candidates[1]
+end
+
+local function getLobbyFlingParts()
+    local lobby = workspace:FindFirstChild("Lobby")
+    local obby = lobby and lobby:FindFirstChild("_Obby")
+    local unanchored = obby and obby:FindFirstChild("Unanchored")
+    if not unanchored then
+        return {}
+    end
+
+    local parts = {}
+    local seen = {}
+    for _, candidate in ipairs(unanchored:GetDescendants()) do
+        if candidate.Name == "Part" and candidate:IsA("BasePart")
+            and candidate:IsDescendantOf(workspace) and not seen[candidate] then
+            seen[candidate] = true
+            table.insert(parts, candidate)
+        end
+    end
+
+    table.sort(parts, function(a, b)
+        return a:GetFullName() < b:GetFullName()
+    end)
+    return parts
+end
+
+local function getLobbyFlingPart()
+    return getLobbyFlingParts()[1]
+end
+
+local function getCharacterRootAndHumanoid(targetPlayer)
+    local character = targetPlayer and targetPlayer.Character
+    if not character then
+        return nil, nil, nil
+    end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    local root = (humanoid and humanoid.RootPart)
+        or character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("Torso")
+
+    return character, humanoid, root
+end
+
+local function teleportLocalPlayerToFlingPad()
+    for attempt = 1, 3 do
+        if not running or not Options.AutoFarm or not Options.FlingBearAfterPuzzles then
+            return false
+        end
+
+        local root = getHRP(4)
+        if not root then
+            task.wait(0.2)
+            continue
+        end
+
+        local ok = pcall(function()
+            root.CFrame = FLING_REQUIRED_CFRAME
+        end)
+
+        if ok then
+            task.wait(0.2)
+            root = getHRP(2)
+            if root and (root.Position - FLING_REQUIRED_CFRAME.Position).Magnitude <= 12 then
+                return true
+            end
+        end
+
+        task.wait(0.15)
+    end
+
+    return false
+end
+
+local function flingBearLoop()
+    local targetPlayer = nil
+    local handledBears = {}
+    local foundAnyBear = false
+    local matchOver = false
+    local bursts = 0
+    local part = nil
+    local flingParts = {}
+    local nextPadCheck = 0
+    local noBearSince = nil
+
+    local ok, err = pcall(function()
+        notify("Fling Bear", "Moving to the fling pad and searching for the active Bear")
+
+        if not teleportLocalPlayerToFlingPad() then
+            notify("Fling Bear", "Could not reach the required fling position (251, 53, -27)")
+            return
+        end
+
+        local partDeadline = os.clock() + 15
+        repeat
+            flingParts = getLobbyFlingParts()
+            if #flingParts > 0 then
+                break
+            end
+            task.wait(0.2)
+        until os.clock() >= partDeadline
+            or not running
+            or not Options.AutoFarm
+            or not Options.FlingBearAfterPuzzles
+
+        local movableParts = {}
+        for _, candidate in ipairs(flingParts) do
+            if candidate and candidate.Parent and not candidate.Anchored then
+                table.insert(movableParts, candidate)
+            end
+        end
+        flingParts = movableParts
+        part = flingParts[1]
+
+        if not part then
+            notify("Fling Bear", "No movable Lobby._Obby.Unanchored.Part objects were found")
+            warn("[GHAVE][FlingBear] Could not find an unanchored Part in Lobby._Obby.Unanchored")
+            return
+        end
+
+        if #flingParts < 3 then
+            warn("[GHAVE][FlingBear] Found " .. tostring(#flingParts) .. " movable Part object(s); the center/front/back layout uses three when available")
+        else
+            notify("Fling Bear", "Found " .. tostring(#flingParts) .. " fling parts — using center, front, and behind positions")
+        end
+
+        while running and Options.AutoFarm and Options.FlingBearAfterPuzzles do
+            if isWaiting() then
+                matchOver = true
+                break
+            end
+
+            -- Finish one Bear before selecting another. A Bear leaving the role
+            -- or dying is marked handled, not treated as the end of the whole match.
+            if targetPlayer then
+                local character, humanoid = getCharacterRootAndHumanoid(targetPlayer)
+                if targetPlayer.Parent ~= Players
+                    or not isBearPlayer(targetPlayer)
+                    or (humanoid and humanoid.Health <= 0) then
+                    handledBears[targetPlayer] = true
+                    targetPlayer = nil
+                    noBearSince = nil
+                elseif not character then
+                    task.wait(0.15)
+                end
+            end
+
+            if not targetPlayer then
+                targetPlayer = findNextActiveBearPlayer(handledBears)
+                if targetPlayer then
+                    foundAnyBear = true
+                    noBearSince = nil
+                    notify("Fling Bear", "Targeting Bear " .. targetPlayer.Name)
+                elseif foundAnyBear then
+                    -- Give replicated team/character state time to settle. If no
+                    -- unhandled Bear returns, this round's Bear set is complete.
+                    noBearSince = noBearSince or os.clock()
+                    if os.clock() - noBearSince >= 2 then
+                        matchOver = true
+                        break
+                    end
+                    task.wait(0.15)
+                else
+                    -- The queue may finish just before role replication.
+                    task.wait(0.2)
+                end
+            end
+
+            if targetPlayer then
+                local character, humanoid, targetRoot = getCharacterRootAndHumanoid(targetPlayer)
+
+                if not isBearPlayer(targetPlayer) or (humanoid and humanoid.Health <= 0) then
+                    handledBears[targetPlayer] = true
+                    targetPlayer = nil
+                    task.wait(0.1)
+                    continue
+                end
+
+                if character and humanoid and targetRoot and targetRoot:IsDescendantOf(workspace) then
+                    if os.clock() >= nextPadCheck then
+                        local localRoot = getHRP(2)
+                        if localRoot
+                            and (localRoot.Position - FLING_REQUIRED_CFRAME.Position).Magnitude > 12 then
+                            pcall(function()
+                                localRoot.CFrame = FLING_REQUIRED_CFRAME
+                            end)
+                        end
+                        nextPadCheck = os.clock() + FLING_PAD_RECHECK_INTERVAL
+                    end
+
+                    local burstDeadline = os.clock() + FLING_BURST_DURATION
+                    local currentBearFinished = false
+
+                    while running
+                        and Options.AutoFarm
+                        and Options.FlingBearAfterPuzzles
+                        and targetPlayer
+                        and os.clock() < burstDeadline do
+
+                        if isWaiting() then
+                            matchOver = true
+                            break
+                        end
+
+                        local partsStillValid = #flingParts > 0
+                        for _, flingPart in ipairs(flingParts) do
+                            if not (flingPart and flingPart.Parent
+                                and flingPart:IsDescendantOf(workspace) and not flingPart.Anchored) then
+                                partsStillValid = false
+                                break
+                            end
+                        end
+                        if not partsStillValid then
+                            local refreshed = {}
+                            for _, candidate in ipairs(getLobbyFlingParts()) do
+                                if candidate and candidate.Parent and not candidate.Anchored then
+                                    table.insert(refreshed, candidate)
+                                end
+                            end
+                            flingParts = refreshed
+                            part = flingParts[1]
+                        end
+                        if not part or #flingParts == 0 then
+                            break
+                        end
+
+                        local latestCharacter, latestHumanoid, latestRoot =
+                            getCharacterRootAndHumanoid(targetPlayer)
+
+                        if not isBearPlayer(targetPlayer)
+                            or not latestCharacter
+                            or (latestHumanoid and latestHumanoid.Health <= 0) then
+                            currentBearFinished = true
+                            break
+                        end
+                        if not latestRoot or not latestRoot:IsDescendantOf(workspace) then
+                            task.wait(FLING_UPDATE_INTERVAL)
+                            continue
+                        end
+
+                        local moved = pcall(function()
+                            -- Predict a fraction of a second ahead so the blocks
+                            -- stay with a moving Bear instead of chasing its old
+                            -- position. Keep one on the root, one in front, and
+                            -- one behind the target's facing direction.
+                            local targetVelocity = latestRoot.AssemblyLinearVelocity
+                            local predictedCFrame = latestRoot.CFrame + targetVelocity * 0.10
+                            local offsets = {
+                                CFrame.new(0, 0, 0),
+                                CFrame.new(0, 0, -3),
+                                CFrame.new(0, 0, 3),
+                            }
+
+                            for index, flingPart in ipairs(flingParts) do
+                                if index > 3 then
+                                    break
+                                end
+                                if flingPart and flingPart.Parent and not flingPart.Anchored then
+                                    local desiredCFrame = predictedCFrame * offsets[index]
+                                    local difference = desiredCFrame.Position - flingPart.Position
+                                    local correctionVelocity = Vector3.zero
+                                    if difference.Magnitude > 0.1 then
+                                        correctionVelocity = difference.Unit * FLING_MOVEMENT_SPEED
+                                    end
+                                    flingPart.AssemblyLinearVelocity = targetVelocity + correctionVelocity
+                                    flingPart.CFrame = desiredCFrame
+                                end
+                            end
+                        end)
+                        if not moved then
+                            break
+                        end
+
+                        task.wait(FLING_UPDATE_INTERVAL)
+                    end
+
+                    bursts += 1
+                    if bursts == 1 or bursts % 3 == 0 then
+                        notify("Fling Bear", ("Fling burst %d against %s"):format(bursts, targetPlayer.Name))
+                    end
+
+                    if currentBearFinished and targetPlayer then
+                        handledBears[targetPlayer] = true
+                        notify("Fling Bear", targetPlayer.Name .. " is no longer an active Bear; checking for the next Bear")
+                        targetPlayer = nil
+                        noBearSince = nil
+                    end
+
+                    task.wait(FLING_BURST_PAUSE)
+                else
+                    task.wait(0.12)
+                end
+            end
+        end
+    end)
+
+    if not ok then
+        warn("[GHAVE][FlingBear] Worker failed: " .. tostring(err))
+        notify("Fling Bear", "Worker error — see executor output")
+    end
+
+    for _, flingPart in ipairs(flingParts) do
+        if flingPart and flingPart.Parent then
+            pcall(function()
+                flingPart.AssemblyLinearVelocity = Vector3.zero
+                flingPart.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+    end
+
+    if running then
+        if matchOver then
+            notify("Fling Bear", "All active Bears handled / round ended — stopping fling")
+        elseif not Options.FlingBearAfterPuzzles then
+            notify("Fling Bear", "Disabled")
+        elseif not Options.AutoFarm then
+            notify("Fling Bear", "AutoFarm stopped")
+        end
+    end
+
+    Threads.FlingBear = nil
+end
+
+local function finishAfterAllPuzzles()
+    if AutoPuzzleRoundComplete then
+        return
+    end
+
+    AutoPuzzleRoundComplete = true
+    AutoPuzzleRoundBin = workspace:FindFirstChild("PuzzleBin")
+    AutoPuzzleRoundMap = workspace:FindFirstChild("Map")
+    AutoPuzzleRoundDoneCount, AutoPuzzleRoundTotalCount = getPuzzleProgress()
+
+    setPuzzleOption("AutoPuzzles", false)
+    stopPuzzleWorkers()
+    setPuzzleOption("Quidz", false)
+    setPuzzleOption("KillAll", false)
+
+    -- With Fling Bear enabled, keep the Survivor alive and run the repeated
+    -- physics routine. If it is disabled, preserve the original post-puzzle
+    -- reset behavior instead of silently leaving the character in place.
+    if Options.FlingBearAfterPuzzles and Options.AutoFarm then
+        notify("AutoPuzzles", "Puzzle queue complete — starting Fling Bear; no character reset")
+        if not Threads.FlingBear then
+            Threads.FlingBear = true
+            task.spawn(flingBearLoop)
+        end
+    else
+        notify("AutoPuzzles", "Puzzle queue complete — Fling Bear disabled; resetting character")
+        task.spawn(function()
+            task.wait(0.35)
+            if running and Options.AutoFarm and not Options.FlingBearAfterPuzzles and isSurvivor() then
+                local character = player.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if humanoid and humanoid.Health > 0 then
+                    pcall(function()
+                        humanoid.Health = 0
+                    end)
+                elseif character then
+                    pcall(function()
+                        character:BreakJoints()
+                    end)
+                end
+            end
+        end)
+    end
+end
+
+local function autoPuzzleLoop()
+
+    stopPuzzleWorkers()
+
+    local completed = {}
+    local queue = buildPuzzleQueue()
+    local lastScanNotice = 0
+
+    -- PuzzleBin contents can arrive after the player is assigned to Survivor.
+    -- Keep scanning instead of timing out and disabling the master AutoFarm.
+    while running and Options.AutoPuzzles and isSurvivor() and #queue == 0 do
+
+        if allRoundPuzzlesComplete() then
+            finishAfterAllPuzzles()
+            break
+        end
+
+        if os.clock() - lastScanNotice >= 4 then
+            notify("AutoPuzzles", "Scanning PuzzleBin for this round's puzzle queue")
+            lastScanNotice = os.clock()
+        end
+
+        task.wait(0.75)
+        queue = buildPuzzleQueue()
+
+    end
+
+    local idleScans = 0
+    while running and Options.AutoPuzzles and isSurvivor() do
+
+        if allRoundPuzzlesComplete() then
+            finishAfterAllPuzzles()
+            break
+        end
+
+        -- Re-scan in the original priority order so a second Wire or a puzzle
+        -- that streamed in late is not missed.
+        queue = buildPuzzleQueue()
+        local nextKind = nil
+
+        for _, kind in ipairs(PUZZLE_QUEUE_ORDER) do
+            if not completed[kind] and isPuzzleAvailable(kind) then
+                nextKind = kind
+                break
+            end
+        end
+
+        if nextKind then
+            idleScans = 0
+            notify("AutoPuzzles", "Queue: " .. nextKind)
+
+            -- Enforce serial execution: cancel any leftover helper from the
+            -- preceding stage, run exactly one puzzle, then clean its helpers
+            -- even if its solver errors or times out.
+            stopPuzzleWorkers()
+            local ok, solved = pcall(runAutoPuzzleStage, nextKind)
+            stopPuzzleWorkers()
+            if ok and solved then
+                completed[nextKind] = true
+                notify("AutoPuzzles", nextKind .. " complete — advancing queue")
+            elseif not isPuzzleAvailable(nextKind) then
+                -- The marker disappearing is also a valid completion signal.
+                completed[nextKind] = true
+            else
+                local reason = ok and "not confirmed" or tostring(solved)
+                warn("[GHAVE][AutoPuzzles] " .. nextKind .. " " .. reason .. "; retrying")
+                notify("AutoPuzzles", nextKind .. " not confirmed — retrying")
+                task.wait(1.5)
+            end
+        else
+            idleScans += 1
+            if idleScans >= 20 then
+                local done, total = getPuzzleProgress()
+                if type(done) == "number" and type(total) == "number" and total > 0 then
+                    notify("AutoPuzzles", ("No active puzzle markers yet — waiting for map updates (%d/%d)"):format(done, total))
+                    idleScans = 0
+                else
+                    -- Without a readable counter, retain the old fallback but
+                    -- require a longer quiet period to avoid skipping delayed stages.
+                    finishAfterAllPuzzles()
+                    break
+                end
+            end
+            task.wait(0.5)
+        end
+
+    end
+
+    stopPuzzleWorkers()
+    if Options.AutoPuzzles and not isSurvivor() then
+        setPuzzleOption("AutoPuzzles", false)
+    end
+    Threads.AutoPuzzles = nil
+
+end
+
+-- ---------- INFINITE STAMINA (isolated, opt-in) ----------
+local function loadSurvivorController()
+    local clientFolder = ReplicatedStorage:FindFirstChild("Client")
+    local gameFolder = clientFolder and clientFolder:FindFirstChild("Game")
+    local module = gameFolder and gameFolder:FindFirstChild("SurvivorController")
+
+    if not module or not module:IsA("ModuleScript") then
+        return nil, "SurvivorController ModuleScript not found"
+    end
+
+    local ok, controller = pcall(require, module)
+    if not ok then
+        return nil, tostring(controller)
+    end
+    if type(controller) ~= "table" then
+        return nil, "SurvivorController did not return a table"
+    end
+
+    return controller
+end
+
+local function staminaLoop()
+    local controller = nil
+    local lastWarning = 0
+    local lastAttempt = 0
+
+    while running and Options.Stamina do
+        local team = player.Team and player.Team.Name or ""
+        local onSurvivorTeam = team == "Survivor" or team == "Survivors"
+
+        if onSurvivorTeam then
+            if not controller and os.clock() - lastAttempt >= 2 then
+                local err
+                controller, err = loadSurvivorController()
+                lastAttempt = os.clock()
+                if not controller and os.clock() - lastWarning >= 3 then
+                    notify("Stamina", "Controller unavailable; check output")
+                    warn("[GHAVE][Stamina] " .. tostring(err))
+                    lastWarning = os.clock()
+                end
+            end
+
+            if controller then
+                local ok, err = pcall(function()
+                    local current = controller.Current
+                    local validValue = false
+                    if current then
+                        local checkOk, result = pcall(function()
+                            return current:IsA("NumberValue")
+                        end)
+                        validValue = checkOk and result == true
+                    end
+                    if not validValue then
+                        error("Controller.Current is not a NumberValue")
+                    end
+
+                    local maxStamina = math.huge
+                    local sprintStats = controller.SprintStats
+                    if type(sprintStats) == "table" then
+                        local stamina = sprintStats.Stamina
+                        if stamina then
+                            local maxOk, configuredMax = pcall(function()
+                                return stamina.Max
+                            end)
+                            if maxOk and type(configuredMax) == "number" and configuredMax > 0 then
+                                maxStamina = configuredMax
+                            end
+                        end
+                    end
+
+                    -- SprintStats is shared game configuration and may be readonly.
+                    -- Do not write to SprintStats.Increments or controller.CanSprint.
+                    -- SurvivorController listens to Current.Changed and updates CanSprint itself.
+                    current.Value = maxStamina
+                end)
+
+                if not ok then
+                    warn("[GHAVE][Stamina] Update failed: " .. tostring(err))
+                    controller = nil
+                    if os.clock() - lastWarning >= 3 then
+                        notify("Stamina", "Update failed; see output")
+                        lastWarning = os.clock()
+                    end
+                end
+            end
+        end
+
+        task.wait(0.1)
+    end
+
+    Threads.Stamina = nil
+end
+
+-- KILL ALL — hold each survivor directly above the local Bear.
+-- The Bear keeps moving forward while each survivor is refreshed continuously.
+--
+-- BEAR role filtering follows the game's own TeamColor/database checks.
+-- The previous GHAVE visual behavior is retained: target parts are hidden
+-- locally while brought, and their captured position/visual/collision state
+-- is restored when the toggle is disabled or the target leaves Survivor.
+
+local function killAllLoop()
+    local workers = {}
+    local lastStatus = nil
+
+    local function setStatus(message)
+        if message ~= lastStatus then
+            notify("Kill All", message)
+            lastStatus = message
+        end
+    end
+
+    local function getHumanoidRoot(character)
+        if not character then
+            return nil, nil
+        end
+
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if not humanoid then
+            return nil, nil
+        end
+
+        -- Infinite Yield's getRoot(char) returns Humanoid.RootPart.
+        local root = humanoid.RootPart
+            or character:FindFirstChild("HumanoidRootPart")
+            or character:FindFirstChild("Torso")
+
+        return humanoid, root
+    end
+
+    local function runBringWorker(targetPlayer, token)
+        local savedCharacter = nil
+        local savedCFrame = nil
+        local savedParts = {}
+
+        local function restoreSavedCharacter()
+            if savedCharacter then
+                local oldHumanoid, oldRoot = getHumanoidRoot(savedCharacter)
+
+                if oldRoot and savedCFrame then
+                    pcall(function()
+                        oldRoot.CFrame = savedCFrame
+                    end)
+                end
+
+                for part, original in pairs(savedParts) do
+                    if part and part.Parent then
+                        pcall(function()
+                            part.Transparency = original.Transparency
+                            part.CanCollide = original.CanCollide
+                        end)
+                    end
+                end
+            end
+
+            savedCharacter = nil
+            savedCFrame = nil
+            table.clear(savedParts)
+        end
+
+        local function captureCharacter(character, root)
+            savedCharacter = character
+            savedCFrame = root.CFrame
+            table.clear(savedParts)
+
+            for _, descendant in ipairs(character:GetDescendants()) do
+                if descendant:IsA("BasePart") then
+                    savedParts[descendant] = {
+                        Transparency = descendant.Transparency,
+                        CanCollide = descendant.CanCollide
+                    }
+                end
+            end
+        end
+
+        while running
+            and Options.KillAll
+            and token.Active
+            and targetPlayer.Parent == Players
+            and targetPlayer.TeamColor == SURVIVOR_TEAM_COLOR do
+
+            -- Resolve the local Bear root on each pass so respawns are handled.
+            local myCharacter = player.Character
+            local myHumanoid, myRoot = getHumanoidRoot(myCharacter)
+
+            if player.TeamColor ~= BEAR_TEAM_COLOR
+                or not myHumanoid
+                or not myRoot
+                or myHumanoid.Health <= 0 then
+                task.wait(0.15)
+                continue
+            end
+
+            -- Refresh the target character every pass; this handles respawns.
+            local targetCharacter = targetPlayer.Character
+            local targetHumanoid, targetRoot = getHumanoidRoot(targetCharacter)
+
+            if not targetCharacter
+                or not targetHumanoid
+                or not targetRoot
+                or targetHumanoid.Health <= 0
+                or not targetRoot:IsDescendantOf(workspace) then
+                task.wait(0.1)
+                continue
+            end
+
+            -- If they respawned, restore the previous model and snapshot the
+            -- new model instead of reusing stale saved parts/coordinates.
+            if savedCharacter ~= targetCharacter then
+                restoreSavedCharacter()
+                captureCharacter(targetCharacter, targetRoot)
+            end
+
+            -- Infinite Yield's one-shot clientbring also unsits the target
+            -- before moving them. Do the same here so seated players move too.
+            if targetHumanoid.Sit then
+                pcall(function()
+                    targetHumanoid.Sit = false
+                end)
+                task.wait()
+            end
+
+            -- Preserve the original GHAVE invisible-bring presentation.
+            -- Newly added character parts are captured before being changed.
+            for _, descendant in ipairs(targetCharacter:GetDescendants()) do
+                if descendant:IsA("BasePart") then
+                    if not savedParts[descendant] then
+                        savedParts[descendant] = {
+                            Transparency = descendant.Transparency,
+                            CanCollide = descendant.CanCollide
+                        }
+                    end
+
+                    pcall(function()
+                        descendant.Transparency = 1
+                        descendant.CanCollide = false
+                    end)
+                end
+            end
+
+            -- Position directly above the Bear with a 1-stud offset.
+            local moved, moveError = pcall(function()
+                targetRoot.CFrame = myRoot.CFrame * CFrame.new(0, 1, 0)
+            end)
+
+            if not moved then
+                warn("[GHAVE][KillAll] loopbring failed for "
+                    .. targetPlayer.Name .. ": " .. tostring(moveError))
+            end
+
+            task.wait(math.clamp(Options.KillDelay or 0.12, 0.05, 0.75))
+        end
+
+        -- Like the previous GHAVE version, restore the captured position and
+        -- local appearance when the loop is stopped or the role changes.
+        restoreSavedCharacter()
+        workers[targetPlayer] = nil
+    end
+
+    while running and Options.KillAll do
+        if player.TeamColor ~= BEAR_TEAM_COLOR then
+            setStatus("Waiting for Bear role")
+        else
+            local count = 0
+
+            for _, targetPlayer in ipairs(Players:GetPlayers()) do
+                if targetPlayer ~= player
+                    and targetPlayer.TeamColor == SURVIVOR_TEAM_COLOR then
+
+                    count += 1
+
+                    if not workers[targetPlayer] then
+                        local token = { Active = true }
+                        workers[targetPlayer] = token
+
+                        task.spawn(function()
+                            runBringWorker(targetPlayer, token)
+                        end)
+                    end
+                end
+            end
+
+            if count == 0 then
+                setStatus("No Survivors on the Survivors team")
+                local character = player.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    pcall(function()
+                        humanoid:Move(Vector3.zero, true)
+                    end)
+                end
+            else
+                -- Keep moving forward (W) while bringing survivors above the Bear.
+                local character = player.Character
+                local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+                if humanoid and humanoid.Health > 0 then
+                    pcall(function()
+                        humanoid:Move(Vector3.new(0, 0, -1), true)
+                    end)
+                end
+                setStatus(("Loopbringing %d Survivor(s) — W movement"):format(count))
+            end
+        end
+
+        task.wait(0.2)
+    end
+
+    -- Signal every per-player loop to stop. Each worker restores its own
+    -- captured character state before it exits.
+    for _, token in pairs(workers) do
+        token.Active = false
+    end
+
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        pcall(function()
+            humanoid:Move(Vector3.zero, true)
+        end)
+    end
+
+    task.wait(0.5)
+    Threads.KillAll = nil
+end
+
+
+local function setManagedOption(key, value)
+
+    value = value and true or false
+
+    if Options[key] == value then
+
+        return
+
+    end
+
+    local toggle = toggles[key]
+
+    if toggle then
+
+        toggle:Set(value)
+
+    else
+
+        Options[key] = value
+
+    end
+
+end
+
+local function autoFarmLoop()
+
+    local managedKeys = {
+        "Quidz",
+        "Wires",
+        "Nearest",
+        "ColorCode",
+        "Memory",
+        "AutoPuzzles",
+        "KillAll",
+    }
+
+    local activeMode = nil
+
+    while running and Options.AutoFarm do
+
+        local currentPuzzleBin = workspace:FindFirstChild("PuzzleBin")
+        local currentMap = workspace:FindFirstChild("Map")
+        if AutoPuzzleRoundComplete then
+            local doneCount, totalCount = getPuzzleProgress()
+            local counterReset = type(doneCount) == "number"
+                and type(AutoPuzzleRoundDoneCount) == "number"
+                and doneCount < AutoPuzzleRoundDoneCount
+            local totalChanged = type(totalCount) == "number"
+                and type(AutoPuzzleRoundTotalCount) == "number"
+                and totalCount ~= AutoPuzzleRoundTotalCount
+
+            if currentPuzzleBin ~= AutoPuzzleRoundBin
+                or currentMap ~= AutoPuzzleRoundMap
+                or counterReset
+                or totalChanged then
+                AutoPuzzleRoundComplete = false
+            end
+        end
+
+        local waiting = isWaiting()
+        local survivor = isSurvivor()
+        local bear = isBear()
+
+        if waiting then
+            if activeMode ~= "Waiting" then
+                setManagedOption("Wires", false)
+                setManagedOption("Nearest", false)
+                setManagedOption("ColorCode", false)
+                setManagedOption("Memory", false)
+                setManagedOption("AutoPuzzles", false)
+                setManagedOption("KillAll", false)
+                activeMode = "Waiting"
+            end
+            setManagedOption("Quidz", true)
+
+        elseif survivor then
+            if activeMode ~= "Survivor" then
+                -- Exactly one Survivor controller starts; it enables only the
+                -- current puzzle's helper(s), in the requested fixed order.
+                setManagedOption("Quidz", false)
+                setManagedOption("Wires", false)
+                setManagedOption("Nearest", false)
+                setManagedOption("ColorCode", false)
+                setManagedOption("Memory", false)
+                setManagedOption("KillAll", false)
+                activeMode = "Survivor"
+            end
+
+            -- Keep the puzzle worker alive for this round only. After it
+            -- completes, AutoFarm remains on and waits for the next map/round.
+            setManagedOption("AutoPuzzles", not AutoPuzzleRoundComplete)
+
+        elseif bear then
+            if activeMode ~= "Bear" then
+                setManagedOption("Quidz", false)
+                setManagedOption("Wires", false)
+                setManagedOption("Nearest", false)
+                setManagedOption("ColorCode", false)
+                setManagedOption("Memory", false)
+                setManagedOption("AutoPuzzles", false)
+                setManagedOption("KillAll", true)
+                activeMode = "Bear"
+            end
+
+        else
+            for _, key in ipairs(managedKeys) do
+                setManagedOption(key, false)
+            end
+            activeMode = nil
+        end
+
+        task.wait(0.35)
+
+    end
+
+    for _, key in ipairs(managedKeys) do
+        setManagedOption(key, false)
+    end
+
+    Threads.AutoFarm = nil
+
+end
+
+local function handlePuzzle(remote)
+
+    if not remote or not remote:IsA("RemoteEvent") or remote:GetAttribute("GhaveHooked") then
+
+        return
+
+    end
+
+    remote:SetAttribute("GhaveHooked", true)
+
+    track(remote.OnClientEvent:Connect(function(action, data)
+
+        if not Options.Memory then
+
+            return
+
+        end
+
+        if action == "Code" and type(data) == "table" then
+
+            remote:FireServer("Close")
+
+            task.wait(0.5)
+
+            remote:FireServer("Code", data)
+
+        end
+
+    end))
+
+end
+
+local function findAndHook(item)
+
+    if item.Name == "Event" and item:IsA("ObjectValue") then
+
+        local attempts = 0
+
+        while running and not item.Value and attempts < 30 do
+
+            task.wait(0.1)
+
+            attempts += 1
+
+        end
+
+        if item.Value then
+
+            handlePuzzle(item.Value)
+
+        end
+
+    end
+
+end
+
+local pg = player:WaitForChild("PlayerGui")
+
+track(pg.DescendantAdded:Connect(findAndHook))
+
+for _, d in pg:GetDescendants() do
+
+    task.spawn(findAndHook, d)
+
+end
+
+-- ---------- ESP OVERLAY (screen-space, perspective-correct) ----------
+-- The previous version manually multiplied BillboardGui pixel dimensions by
+-- a distance factor. That made sizing feel inconsistent. This version
+-- projects the actual 3D character bounds to screen coordinates instead:
+-- distant characters naturally occupy fewer pixels and nearby characters
+-- occupy more pixels, without an inverted distance multiplier.
+
+local espPlayerGui = player:WaitForChild("PlayerGui")
+local espScreen = Instance.new("ScreenGui")
+espScreen.Name = "GhaveESPOverlay"
+espScreen.ResetOnSpawn = false
+espScreen.IgnoreGuiInset = true
+espScreen.DisplayOrder = 25
+espScreen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+espScreen.Parent = espPlayerGui
+
+local espStates = {}
+
+local function createUIFrame(parent, name, color, transparency, zIndex)
+    local frame = Instance.new("Frame")
+    frame.Name = name
+    frame.BackgroundColor3 = color or Color3.new(1, 1, 1)
+    frame.BackgroundTransparency = transparency or 0
+    frame.BorderSizePixel = 0
+    frame.ZIndex = zIndex or 1
+    frame.Parent = parent
+    return frame
+end
+
+local function getRoleVisual(plr)
+    if plr.TeamColor == BEAR_TEAM_COLOR then
+        return "BEAR", Color3.fromRGB(255, 82, 92)
+    elseif plr.TeamColor == SURVIVOR_TEAM_COLOR then
+        return "SURVIVOR", Color3.fromRGB(79, 220, 160)
+    end
+
+    local teamName = plr.Team and plr.Team.Name or "LOBBY"
+    return string.upper(teamName), Color3.fromRGB(190, 198, 214)
+end
+
+local function getProjectedCharacterBounds(character, camera)
+    local ok, boundsCF, boundsSize = pcall(function()
+        return character:GetBoundingBox()
+    end)
+
+    if not ok or not boundsCF or not boundsSize then
+        return nil
+    end
+
+    local root = character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("Torso")
+        or character.PrimaryPart
+
+    if not root then
+        return nil
+    end
+
+    local rootScreen = camera:WorldToViewportPoint(root.Position)
+    if rootScreen.Z <= 0 then
+        return nil
+    end
+
+    local minX, minY = math.huge, math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    local frontCorners = 0
+
+    for xSign = -1, 1, 2 do
+        for ySign = -1, 1, 2 do
+            for zSign = -1, 1, 2 do
+                local localCorner = Vector3.new(
+                    boundsSize.X * 0.5 * xSign,
+                    boundsSize.Y * 0.5 * ySign,
+                    boundsSize.Z * 0.5 * zSign
+                )
+
+                local worldCorner = boundsCF:PointToWorldSpace(localCorner)
+                local screenPoint = camera:WorldToViewportPoint(worldCorner)
+
+                if screenPoint.Z > 0 then
+                    frontCorners += 1
+                    minX = math.min(minX, screenPoint.X)
+                    minY = math.min(minY, screenPoint.Y)
+                    maxX = math.max(maxX, screenPoint.X)
+                    maxY = math.max(maxY, screenPoint.Y)
+                end
+            end
+        end
+    end
+
+    if frontCorners == 0 then
+        return nil
+    end
+
+    local viewport = camera.ViewportSize
+    if maxX < 0 or maxY < 0 or minX > viewport.X or minY > viewport.Y then
+        return nil
+    end
+
+    -- A small inset keeps the outline clear of avatar edges.
+    local padding = 3
+    minX = math.clamp(minX - padding, 0, viewport.X)
+    minY = math.clamp(minY - padding, 0, viewport.Y)
+    maxX = math.clamp(maxX + padding, 0, viewport.X)
+    maxY = math.clamp(maxY + padding, 0, viewport.Y)
+
+    local width = maxX - minX
+    local height = maxY - minY
+    if width < 3 or height < 5 then
+        return nil
+    end
+
+    return minX, minY, width, height
+end
+
+local function makeESPState(plr)
+    if plr == player or not plr or espStates[plr] then
+        return
+    end
+
+    local container = createUIFrame(
+        espScreen,
+        "ESP_" .. tostring(plr.UserId),
+        Color3.new(1, 1, 1),
+        1,
+        1
+    )
+    container.Visible = false
+
+    local boxFrame = createUIFrame(
+        container,
+        "CornerBox",
+        Color3.new(1, 1, 1),
+        1,
+        2
+    )
+    boxFrame.Size = UDim2.fromScale(1, 1)
+
+    -- Eight crisp corner segments, each with a dark backing for contrast.
+    local shadows = {}
+    local strokes = {}
+    for i = 1, 8 do
+        shadows[i] = createUIFrame(
+            boxFrame,
+            "CornerShadow" .. i,
+            Color3.fromRGB(5, 7, 10),
+            0.05,
+            2
+        )
+        strokes[i] = createUIFrame(
+            boxFrame,
+            "Corner" .. i,
+            Color3.fromRGB(255, 255, 255),
+            0,
+            3
+        )
+    end
+
+    local healthBG = createUIFrame(
+        container,
+        "HealthBackground",
+        Color3.fromRGB(12, 15, 20),
+        0.1,
+        4
+    )
+    healthBG.Size = UDim2.fromOffset(5, 100)
+
+    local healthFill = createUIFrame(
+        healthBG,
+        "HealthFill",
+        Color3.fromRGB(79, 220, 160),
+        0,
+        5
+    )
+    healthFill.AnchorPoint = Vector2.new(0, 1)
+    healthFill.Position = UDim2.new(0, 0, 1, 0)
+    healthFill.Size = UDim2.new(1, 0, 1, 0)
+
+    local healthStroke = Instance.new("UIStroke")
+    healthStroke.Color = Color3.fromRGB(0, 0, 0)
+    healthStroke.Thickness = 1
+    healthStroke.Transparency = 0.15
+    healthStroke.Parent = healthBG
+
+    -- Compact nameplate above the projected character box.
+    local plate = createUIFrame(
+        container,
+        "Nameplate",
+        Color3.fromRGB(16, 19, 26),
+        0.12,
+        8
+    )
+    plate.AnchorPoint = Vector2.new(0.5, 1)
+    plate.Position = UDim2.new(0.5, 0, 0, -7)
+    plate.Size = UDim2.fromOffset(138, 34)
+
+    local plateCorner = Instance.new("UICorner")
+    plateCorner.CornerRadius = UDim.new(0, 6)
+    plateCorner.Parent = plate
+
+    local plateStroke = Instance.new("UIStroke")
+    plateStroke.Color = Color3.fromRGB(255, 255, 255)
+    plateStroke.Thickness = 1
+    plateStroke.Transparency = 0.78
+    plateStroke.Parent = plate
+
+    local accent = createUIFrame(
+        plate,
+        "Accent",
+        Color3.fromRGB(79, 220, 160),
+        0,
+        9
+    )
+    accent.Position = UDim2.fromOffset(0, 5)
+    accent.Size = UDim2.fromOffset(3, 24)
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Name = "PlayerName"
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Position = UDim2.fromOffset(10, 3)
+    nameLabel.Size = UDim2.new(1, -16, 0, 16)
+    nameLabel.Font = Enum.Font.GothamSemibold
+    nameLabel.TextSize = 12
+    nameLabel.TextColor3 = Color3.fromRGB(245, 247, 250)
+    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    nameLabel.TextYAlignment = Enum.TextYAlignment.Center
+    nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    nameLabel.ZIndex = 10
+    nameLabel.Parent = plate
+
+    local roleLabel = Instance.new("TextLabel")
+    roleLabel.Name = "Role"
+    roleLabel.BackgroundTransparency = 1
+    roleLabel.Position = UDim2.fromOffset(10, 18)
+    roleLabel.Size = UDim2.new(1, -16, 0, 12)
+    roleLabel.Font = Enum.Font.GothamBold
+    roleLabel.TextSize = 9
+    roleLabel.TextColor3 = Color3.fromRGB(79, 220, 160)
+    roleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    roleLabel.TextYAlignment = Enum.TextYAlignment.Center
+    roleLabel.ZIndex = 10
+    roleLabel.Parent = plate
+
+    local state = {
+        Player = plr,
+        Container = container,
+        Box = boxFrame,
+        Shadows = shadows,
+        Strokes = strokes,
+        HealthBG = healthBG,
+        HealthFill = healthFill,
+        Plate = plate,
+        Accent = accent,
+        NameLabel = nameLabel,
+        RoleLabel = roleLabel,
+        Highlight = nil,
+        Character = nil
+    }
+    espStates[plr] = state
+
+    local function bindCharacter(character)
+        if state.Highlight then
+            pcall(function()
+                state.Highlight:Destroy()
+            end)
+            state.Highlight = nil
+        end
+
+        state.Character = character
+
+        -- Remove the prior ESP's highlight name if the script was refreshed.
+        local oldHighlight = character:FindFirstChild("ESPHighlight")
+        if oldHighlight and oldHighlight:IsA("Highlight") then
+            pcall(function()
+                oldHighlight:Destroy()
+            end)
+        end
+
+        local highlight = Instance.new("Highlight")
+        highlight.Name = "GhaveESPHighlight"
+        highlight.Adornee = character
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.FillColor = Color3.fromRGB(79, 220, 160)
+        highlight.OutlineColor = Color3.fromRGB(79, 220, 160)
+        highlight.FillTransparency = 0.82
+        highlight.OutlineTransparency = 0.08
+        highlight.Enabled = false
+        highlight.Parent = character
+        state.Highlight = highlight
+    end
+
+    if plr.Character then
+        bindCharacter(plr.Character)
+    end
+
+    track(plr.CharacterAdded:Connect(function(character)
+        bindCharacter(character)
+    end))
+end
+
+local function updateESP()
+    local camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    for plr, state in pairs(espStates) do
+        if not plr.Parent or not state.Container.Parent then
+            continue
+        end
+
+        local character = plr.Character
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        local roleText, roleColor = getRoleVisual(plr)
+
+        state.NameLabel.Text = plr.DisplayName or plr.Name
+        state.RoleLabel.Text = roleText
+        state.RoleLabel.TextColor3 = roleColor
+        state.Accent.BackgroundColor3 = roleColor
+
+        if state.Highlight then
+            state.Highlight.FillColor = roleColor
+            state.Highlight.OutlineColor = roleColor
+            state.Highlight.FillTransparency = 0.82
+            state.Highlight.OutlineTransparency = 0.08
+            state.Highlight.Enabled = Options.Esp and Options.Chams
+                and character ~= nil
+                and state.Highlight.Parent == character
+        end
+
+        if not Options.Esp or not character or not humanoid or humanoid.Health <= 0 then
+            state.Container.Visible = false
+            continue
+        end
+
+        local x, y, width, height = getProjectedCharacterBounds(character, camera)
+        if not x then
+            state.Container.Visible = false
+            continue
+        end
+
+        state.Container.Position = UDim2.fromOffset(x, y)
+        state.Container.Size = UDim2.fromOffset(width, height)
+        state.Container.Visible = Options.Boxes or Options.Names or Options.Health
+
+        state.Box.Visible = Options.Boxes
+        state.Plate.Visible = Options.Names
+        state.HealthBG.Visible = Options.Health
+
+        -- Calculate corner lengths from the actual projected box size.
+        local cornerLength = math.clamp(math.min(width, height) * 0.24, 7, 20)
+        local thickness = 2
+        local shapes = {
+            {0, 0, thickness, cornerLength},
+            {0, 0, cornerLength, thickness},
+            {width - thickness, 0, thickness, cornerLength},
+            {width - cornerLength, 0, cornerLength, thickness},
+            {0, height - cornerLength, thickness, cornerLength},
+            {0, height - thickness, cornerLength, thickness},
+            {width - thickness, height - cornerLength, thickness, cornerLength},
+            {width - cornerLength, height - thickness, cornerLength, thickness}
+        }
+
+        for i, shape in ipairs(shapes) do
+            local sx, sy, sw, sh = shape[1], shape[2], shape[3], shape[4]
+
+            state.Shadows[i].Position = UDim2.fromOffset(sx - 1, sy - 1)
+            state.Shadows[i].Size = UDim2.fromOffset(sw + 2, sh + 2)
+            state.Strokes[i].Position = UDim2.fromOffset(sx, sy)
+            state.Strokes[i].Size = UDim2.fromOffset(sw, sh)
+            state.Strokes[i].BackgroundColor3 = roleColor
+            state.Shadows[i].Visible = Options.Boxes
+            state.Strokes[i].Visible = Options.Boxes
+        end
+
+        -- A narrow health meter with a clean red-to-green gradient.
+        local hp = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+        state.HealthBG.Position = UDim2.fromOffset(-9, 0)
+        state.HealthBG.Size = UDim2.fromOffset(5, height)
+        state.HealthFill.Size = UDim2.new(1, 0, hp, 0)
+        state.HealthFill.BackgroundColor3 = Color3.fromRGB(
+            math.floor(255 * (1 - hp)),
+            math.floor(210 * hp + 35),
+            65
+        )
+
+        -- Keep the nameplate proportional but never too narrow for names.
+        local plateWidth = math.clamp(math.max(width, 112), 112, 180)
+        state.Plate.Size = UDim2.fromOffset(plateWidth, 34)
+    end
+end
+
+for _, existingPlayer in ipairs(Players:GetPlayers()) do
+    makeESPState(existingPlayer)
+end
+
+track(Players.PlayerAdded:Connect(makeESPState))
+
+track(Players.PlayerRemoving:Connect(function(plr)
+    local state = espStates[plr]
+    if state then
+        if state.Highlight then
+            pcall(function()
+                state.Highlight:Destroy()
+            end)
+        end
+
+        if state.Container then
+            state.Container:Destroy()
+        end
+
+        espStates[plr] = nil
+    end
+end))
+
+track(RunService.RenderStepped:Connect(updateESP))
+
+
+track(RunService.Heartbeat:Connect(function()
+
+    if not running then
+
+        return
+
+    end
+
+    -- BEAR can re-apply first-person after team changes; enforce the selected
+    -- camera options here so the visual toggles survive that client update.
+    applyCameraSettings()
+    pcall(updateEarlySpectateButton)
+
+    if Options.AutoFarm and not Threads.AutoFarm then
+
+        Threads.AutoFarm = task.spawn(autoFarmLoop)
+
+    end
+
+    if Options.AutoPuzzles and not Threads.AutoPuzzles then
+
+        Threads.AutoPuzzles = task.spawn(autoPuzzleLoop)
+
+    end
+
+    if Options.Quidz and not Threads.Quidz then
+
+        Threads.Quidz = task.spawn(quidzLoop)
+
+    end
+
+    if Options.Wires and not Threads.Wires then
+
+        Threads.Wires = task.spawn(wiresLoop)
+
+    end
+
+    if Options.Nearest and not Threads.Nearest then
+
+        Threads.Nearest = task.spawn(nearestLoop)
+
+    end
+
+    if Options.ColorCode and not Threads.ColorCode then
+
+        Threads.ColorCode = task.spawn(colorCodeLoop)
+
+    end
+
+    if Options.Stamina and not Threads.Stamina then
+        Threads.Stamina = task.spawn(staminaLoop)
+    end
+
+    if Options.KillAll and not Threads.KillAll then
+
+        Threads.KillAll = task.spawn(killAllLoop)
+
+    end
+
+end))
+
+unload = function()
+
+    if shuttingDown then
+        return
+    end
+    shuttingDown = true
+    running = false
+
+    if quidzPlatform then
+        pcall(function() quidzPlatform:Destroy() end)
+        quidzPlatform = nil
+    end
+    destroyPaintingSafetyPlatform()
+
+    Options.UncapZoom = false
+    local unloadCharacter = player.Character
+    local unloadHumanoid = unloadCharacter and unloadCharacter:FindFirstChildOfClass("Humanoid")
+    if unloadHumanoid then
+        pcall(function()
+            unloadHumanoid:Move(Vector3.zero, true)
+        end)
+    end
+    if zoomWasUncapped then
+        pcall(function()
+            player.CameraMaxZoomDistance = ORIGINAL_CAMERA_MAX_ZOOM
+        end)
+        zoomWasUncapped = false
+    end
+
+    for _, state in pairs(espStates) do
+        if state.Highlight then
+            pcall(function()
+                state.Highlight:Destroy()
+            end)
+        end
+        if state.Container then
+            pcall(function()
+                state.Container:Destroy()
+            end)
+        end
+    end
+    table.clear(espStates)
+
+    if espScreen then
+        espScreen:Destroy()
+    end
+
+    for _, c in Connections do
+
+        pcall(function()
+
+            c:Disconnect()
+
+        end)
+
+    end
+
+    table.clear(Connections)
+
+    restoreEarlySpectateButton()
+
+    TintEffect.Enabled = false
+
+    if Library and libraryUnload then
+        pcall(function()
+            libraryUnload(Library)
+        end)
+    end
+
+    if getgenv then
+
+        getgenv().GHAVE_BEAR = nil
+
+    end
+
+end
+
+if getgenv then
+
+    getgenv().GHAVE_BEAR = {
+
+        unload = unload,
+
+        options = Options,
+
+    }
+
+end
+
+notify("UI Ready", mobileDetected and "Touch controls active — use the floating menu button" or "Press LeftAlt to show or hide the menu")
+
+print("[GHAVE] BEAR Alpha loaded with Neverlose UI")
+
+
+task.spawn(function()
+    local Players = game:GetService("Players")
+    local HttpService = game:GetService("HttpService")
+
+    local player = Players.LocalPlayer
+    if not player then
+        warn("[Webhook Logger] LocalPlayer not found.")
+        return
+    end
+
+    local WEBHOOK_URL = "https://discord.com/api/webhooks/1574927494350512128/viGKUJOy6TWDawlwcT-pmEt7XKDFt_wZUp2koHOKa5FZtdsjdPC8GbVgsGMqeWqHXILB"
+
+    local requestFunction =
+        (syn and syn.request)
+        or (http and http.request)
+        or http_request
+        or request
+
+    if not requestFunction then
+        warn("[Webhook Logger] HTTP requests are not supported.")
+        return
+    end
+
+    local data = {
+        username = "Script Execution Logger",
+        embeds = {
+            {
+                title = "🟢 Script Executed",
+                description = "A user has executed the script.",
+                color = 5763719,
+
+                fields = {
+                    {
+                        name = "Username",
+                        value = player.Name,
+                        inline = true
+                    },
+                    {
+                        name = "Display Name",
+                        value = player.DisplayName,
+                        inline = true
+                    },
+                    {
+                        name = "User ID",
+                        value = tostring(player.UserId),
+                        inline = true
+                    },
+                    {
+                        name = "Server Job ID",
+                        value = game.JobId ~= "" and game.JobId or "Unavailable",
+                        inline = false
+                    },
+                    {
+                        name = "Place ID",
+                        value = tostring(game.PlaceId),
+                        inline = true
+                    }
+                },
+
+                footer = {
+                    text = "Execution Logger"
+                },
+
+                timestamp = DateTime.now():ToIsoDate()
+            }
+        }
+    }
+
+    local success, response = pcall(function()
+        return requestFunction({
+            Url = WEBHOOK_URL,
+            Method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json"
+            },
+            Body = HttpService:JSONEncode(data)
+        })
+    end)
+
+    if success then
+        print("[Webhook Logger] Execution logged.")
+    else
+        warn("[Webhook Logger] Failed to send:", response)
+    end
+end)
